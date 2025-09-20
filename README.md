@@ -67,6 +67,234 @@ View available make targets:
 make help
 ```
 
+## Library Usage
+
+nvcz can be used as a C++ library in your own applications, providing GPU-accelerated compression/decompression functionality. This allows you to integrate nvcz into custom data processing pipelines, applications, and frameworks.
+
+### Building the Library
+
+Build the library components:
+```bash
+make lib          # Build both shared and static libraries
+make lib-shared   # Build shared library only
+make lib-static   # Build static library only
+```
+
+### Installation
+
+Install the library and headers system-wide:
+```bash
+make install-lib  # Install library and headers
+sudo make install-lib  # Install with root permissions
+```
+
+Custom installation paths:
+```bash
+make LIBDIR=/opt/lib INCDIR=/opt/include install-lib
+```
+
+### Using as a Library
+
+#### Basic Usage
+
+```cpp
+#include <nvcz/nvcz.hpp>
+#include <iostream>
+#include <vector>
+
+int main() {
+    // Check if nvcz is available
+    if (!nvcz::is_available()) {
+        std::cerr << "CUDA or nvCOMP not available" << std::endl;
+        return 1;
+    }
+
+    // Create a compressor with default settings
+    auto compressor = nvcz::create_compressor();
+
+    // Prepare test data
+    std::vector<uint8_t> input_data = {'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd', '!'};
+    std::vector<uint8_t> compressed_data(compressor->get_max_compressed_size(input_data.size()));
+
+    size_t compressed_size = compressed_data.size();
+
+    // Compress the data
+    auto result = compressor->compress(
+        input_data.data(),
+        input_data.size(),
+        compressed_data.data(),
+        &compressed_size
+    );
+
+    if (result) {
+        std::cout << "Compression successful!" << std::endl;
+        std::cout << "Input size: " << result.stats.input_bytes << " bytes" << std::endl;
+        std::cout << "Compressed size: " << result.stats.compressed_bytes << " bytes" << std::endl;
+        std::cout << "Compression ratio: " << result.stats.compression_ratio << ":1" << std::endl;
+        std::cout << "Throughput: " << result.stats.throughput_mbps << " MB/s" << std::endl;
+    } else {
+        std::cerr << "Compression failed: " << result.error_message << std::endl;
+        return 1;
+    }
+
+    // Resize compressed data to actual size
+    compressed_data.resize(compressed_size);
+
+    // Decompress the data
+    std::vector<uint8_t> decompressed_data(input_data.size());
+    size_t decompressed_size = decompressed_data.size();
+
+    result = compressor->decompress(
+        compressed_data.data(),
+        compressed_data.size(),
+        decompressed_data.data(),
+        &decompressed_size
+    );
+
+    if (result) {
+        std::cout << "Decompression successful!" << std::endl;
+        std::cout << "Decompressed data: ";
+        for (auto byte : decompressed_data) {
+            std::cout << static_cast<char>(byte);
+        }
+        std::cout << std::endl;
+    }
+
+    return 0;
+}
+```
+
+#### Custom Configuration
+
+```cpp
+#include <nvcz/nvcz.hpp>
+
+int main() {
+    // Create custom configuration
+    nvcz::Config config;
+    config.algorithm = nvcz::Algorithm::GDEFLATE;
+    config.chunk_mb = 64;           // 64 MiB chunks
+    config.nvcomp_chunk_kb = 128;   // 128 KiB nvCOMP chunks
+    config.multi_gpu = true;        // Enable multi-GPU
+    config.gpu_ids = {0, 1};        // Use GPUs 0 and 1
+    config.streams_per_gpu = 4;     // 4 streams per GPU
+
+    // Create compressor with custom config
+    auto compressor = nvcz::create_compressor(config);
+
+    // Use compressor...
+    return 0;
+}
+```
+
+#### Integration with Existing Codebases
+
+To use nvcz in your project, you'll need to:
+
+1. **Include headers**: `#include <nvcz/nvcz.hpp>`
+2. **Link the library**:
+   - Shared library: `-lnvcz`
+   - Static library: Path to `libnvcz.a`
+3. **Set include paths**: Add nvcz include directory to compiler flags
+4. **Handle CUDA dependencies**: Ensure CUDA and nvCOMP are available
+
+**CMake Example:**
+```cmake
+find_package(CUDA REQUIRED)
+find_library(NVCZ_LIBRARY nvcz PATHS /usr/local/lib)
+find_path(NVCZ_INCLUDE_DIR nvcz/nvcz.hpp PATHS /usr/local/include)
+
+add_executable(myapp main.cpp)
+target_link_libraries(myapp ${NVCZ_LIBRARY} ${CUDA_LIBRARIES})
+target_include_directories(myapp PRIVATE ${NVCZ_INCLUDE_DIR} ${CUDA_INCLUDE_DIRS})
+```
+
+**Makefile Example:**
+```makefile
+CXX = g++
+CXXFLAGS = -O2 -std=c++17 -I/usr/local/include
+LDFLAGS = -L/usr/local/lib -lnvcz -lcudart -lnvcomp -ldl
+
+myapp: main.cpp
+    $(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+```
+
+### Library API Reference
+
+#### Compressor Class
+
+The main interface for compression/decompression operations:
+
+```cpp
+class Compressor {
+public:
+    Result compress(const uint8_t* input, size_t input_size,
+                   uint8_t* output, size_t* output_size);
+    Result decompress(const uint8_t* input, size_t input_size,
+                     uint8_t* output, size_t* output_size);
+    size_t get_max_compressed_size(size_t input_size) const;
+    const CompressionStats& get_last_stats() const;
+    // ... and more
+};
+```
+
+#### Configuration
+
+Control compression behavior with the `Config` struct:
+
+```cpp
+struct Config {
+    Algorithm algorithm;      // LZ4, GDEFLATE, SNAPPY, or ZSTD
+    uint32_t chunk_mb;        // Chunk size in MiB
+    size_t nvcomp_chunk_kb;   // nvCOMP internal chunk size
+    bool enable_autotune;     // Automatic performance tuning
+    bool multi_gpu;           // Multi-GPU mode
+    std::vector<int> gpu_ids; // GPU IDs to use
+    // ... and more
+};
+```
+
+#### Result and Statistics
+
+Monitor performance and handle errors:
+
+```cpp
+struct Result {
+    bool success;                    // Operation successful?
+    std::string error_message;       // Error description if failed
+    CompressionStats stats;          // Performance statistics
+};
+
+struct CompressionStats {
+    size_t input_bytes;        // Bytes processed
+    size_t compressed_bytes;   // Bytes after compression
+    double compression_ratio;  // Compression ratio achieved
+    double throughput_mbps;    // Processing speed in MB/s
+    int gpu_count;             // Number of GPUs used
+    std::string algorithm;     // Algorithm used
+};
+```
+
+### Performance Considerations
+
+- **Memory Management**: Pre-allocate output buffers using `get_max_compressed_size()`
+- **Batch Processing**: For best performance, compress multiple chunks together
+- **GPU Memory**: Monitor GPU memory usage, especially with large chunk sizes
+- **Multi-GPU**: Use multiple GPUs for higher throughput on large datasets
+- **Stream Processing**: For real-time applications, consider the streaming API (when available)
+
+### Error Handling
+
+The library uses RAII and provides detailed error messages:
+
+```cpp
+auto result = compressor->compress(input, input_size, output, &output_size);
+if (!result) {
+    std::cerr << "Error: " << result.error_message << std::endl;
+    // Handle error appropriately
+}
+```
+
 Usage
 -----
 

@@ -13,20 +13,60 @@ NVCOMP_LIB ?= /usr/lib
 CXXFLAGS := -O2 -std=c++17 -Iinclude -I$(CUDA_INC) -I$(NVCOMP_INC)
 LDFLAGS  := -L$(CUDA_LIB) -L$(NVCOMP_LIB) -lnvcomp -lcudart -ldl
 
-SRC := src/util.cpp src/autotune.cpp \
-       src/codec_lz4.cpp src/codec_gdeflate.cpp src/codec_snappy.cpp src/codec_zstd.cpp \
-       src/codec_factory.cpp src/mgpu.cpp src/main.cpp
+# Core library sources (used by both CLI and library builds)
+LIB_SRC := src/util.cpp src/autotune.cpp \
+           src/codec_lz4.cpp src/codec_gdeflate.cpp src/codec_snappy.cpp src/codec_zstd.cpp \
+           src/codec_factory.cpp src/mgpu.cpp src/nvcz.cpp
 
+# CLI-specific sources
+CLI_SRC := src/main.cpp
+
+# Object files
+LIB_OBJ := $(LIB_SRC:.cpp=.o)
+CLI_OBJ := $(CLI_SRC:.cpp=.o)
+
+# Output files
 BIN := nvcz
+LIB_SHARED := libnvcz.so
+LIB_STATIC := libnvcz.a
 
 # Installation paths
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+LIBDIR ?= $(PREFIX)/lib
+INCDIR ?= $(PREFIX)/include
 
-all: sanity $(BIN)
+all: sanity cli
 
-$(BIN): $(SRC)
+cli: sanity $(BIN)
+
+lib: sanity $(LIB_SHARED) $(LIB_STATIC)
+
+lib-shared: sanity $(LIB_SHARED)
+
+lib-static: sanity $(LIB_STATIC)
+
+all: sanity cli lib
+
+# Library-specific flags
+LIB_CXXFLAGS := $(CXXFLAGS) -fPIC -shared -fvisibility=hidden
+LIB_LDFLAGS := $(LDFLAGS) -shared
+
+# Build CLI executable
+$(BIN): $(LIB_OBJ) $(CLI_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+# Build shared library
+$(LIB_SHARED): $(LIB_OBJ)
+	$(CXX) $(LIB_CXXFLAGS) $^ -o $@ $(LIB_LDFLAGS)
+
+# Build static library
+$(LIB_STATIC): $(LIB_OBJ)
+	ar rcs $@ $^
+
+# Pattern rule for object files
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 sanity:
 	@test -f $(CUDA_INC)/cuda_runtime.h || { echo ">>> cuda_runtime.h not found in $(CUDA_INC). Set CUDA_HOME=/opt/cuda (or your path)"; exit 1; }
@@ -35,29 +75,61 @@ sanity:
 	@echo "Using nvCOMP inc:    $(NVCOMP_INC)"
 	@echo "Using nvCOMP libs:   $(NVCOMP_LIB)"
 
-install: $(BIN)
+install-cli: cli
 	@mkdir -p $(BINDIR)
 	@cp $(BIN) $(BINDIR)/$(BIN)
 	@chmod +x $(BINDIR)/$(BIN)
-	@echo "nvcz installed to $(BINDIR)/$(BIN)"
+	@echo "nvcz CLI installed to $(BINDIR)/$(BIN)"
 
-uninstall:
+install-lib: lib
+	@mkdir -p $(LIBDIR)
+	@cp $(LIB_SHARED) $(LIBDIR)/$(LIB_SHARED)
+	@cp $(LIB_STATIC) $(LIBDIR)/$(LIB_STATIC)
+	@mkdir -p $(INCDIR)
+	@cp -r include/nvcz $(INCDIR)/
+	@echo "nvcz library installed to $(LIBDIR)/"
+	@echo "Headers installed to $(INCDIR)/nvcz/"
+
+install: install-cli install-lib
+
+uninstall-cli:
 	@rm -f $(BINDIR)/$(BIN)
-	@echo "nvcz uninstalled from $(BINDIR)/$(BIN)"
+	@echo "nvcz CLI uninstalled from $(BINDIR)/$(BIN)"
+
+uninstall-lib:
+	@rm -f $(LIBDIR)/$(LIB_SHARED) $(LIBDIR)/$(LIB_STATIC)
+	@rm -rf $(INCDIR)/nvcz
+	@echo "nvcz library uninstalled from $(LIBDIR) and $(INCDIR)"
+
+uninstall: uninstall-cli uninstall-lib
 
 help:
 	@echo "nvcz - High-Performance GPU-Accelerated Compression"
 	@echo ""
-	@echo "Available targets:"
-	@echo "  all       - Build nvcz (default)"
-	@echo "  install   - Install nvcz to $(BINDIR)"
-	@echo "  uninstall - Remove nvcz from $(BINDIR)"
-	@echo "  clean     - Remove built binary"
+	@echo "Available build targets:"
+	@echo "  cli       - Build CLI executable (nvcz)"
+	@echo "  lib       - Build shared and static libraries (libnvcz.so, libnvcz.a)"
+	@echo "  lib-shared - Build shared library only (libnvcz.so)"
+	@echo "  lib-static - Build static library only (libnvcz.a)"
+	@echo "  all       - Build both CLI and libraries"
+	@echo ""
+	@echo "Installation targets:"
+	@echo "  install-cli   - Install CLI executable"
+	@echo "  install-lib   - Install libraries and headers"
+	@echo "  install       - Install both CLI and libraries"
+	@echo "  uninstall-cli - Remove CLI executable"
+	@echo "  uninstall-lib - Remove libraries and headers"
+	@echo "  uninstall     - Remove both CLI and libraries"
+	@echo ""
+	@echo "Other targets:"
+	@echo "  clean     - Remove built files"
 	@echo "  help      - Show this help"
 	@echo ""
 	@echo "Installation paths can be customized:"
-	@echo "  make PREFIX=/usr install          # Install to /usr/bin"
-	@echo "  make BINDIR=/opt/bin install      # Install to /opt/bin"
+	@echo "  make PREFIX=/usr install          # Install to /usr"
+	@echo "  make BINDIR=/opt/bin install-cli  # Install CLI to /opt/bin"
+	@echo "  make LIBDIR=/opt/lib install-lib  # Install library to /opt/lib"
+	@echo "  make INCDIR=/opt/include install-lib # Install headers to /opt/include"
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) $(LIB_SHARED) $(LIB_STATIC) $(LIB_OBJ) $(CLI_OBJ)
