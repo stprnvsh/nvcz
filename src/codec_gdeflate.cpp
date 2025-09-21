@@ -13,6 +13,7 @@ namespace nvcz {
 struct NvcompGDeflate : Codec {
   const size_t chunk_size;
   const bool enable_checksum;
+  std::shared_ptr<nvcomp::nvcompManagerBase> mgr_cache;
 
   NvcompGDeflate(size_t chunk_size_kb, bool enable_checksum)
     : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
@@ -53,14 +54,11 @@ struct NvcompGDeflate : Codec {
         nvcomp::ChecksumPolicy::ComputeAndVerify :
         nvcomp::ChecksumPolicy::NoComputeNoVerify;
 
-    nvcomp::GdeflateManager mgr{
-        chunk_size,
-        opts,
-        s,
-        checksum_policy,
-        nvcomp::BitstreamKind::NVCOMP_NATIVE};
-
-    nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
+    if (!mgr_cache) {
+      mgr_cache = std::make_shared<nvcomp::GdeflateManager>(
+          chunk_size, opts, s, checksum_policy, nvcomp::BitstreamKind::NVCOMP_NATIVE);
+    }
+    nvcomp::CompressionConfig cfg = static_cast<nvcomp::GdeflateManager&>(*mgr_cache).configure_compression(n);
 
     // Device staging buffers
     void* d_in  = nullptr;
@@ -72,7 +70,7 @@ struct NvcompGDeflate : Codec {
     cuda_ck(cudaMemcpyAsync(d_in, src, n, cudaMemcpyHostToDevice, s), "gdef H2D");
 
     // Compress (nvCOMP will write the exact size to d_comp_size on device)
-    mgr.compress(
+    static_cast<nvcomp::GdeflateManager&>(*mgr_cache).compress(
         static_cast<const uint8_t*>(d_in),
         static_cast<uint8_t*>(d_out),
         cfg,
@@ -148,10 +146,11 @@ struct NvcompGDeflate : Codec {
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
 
-    mgr.compress(static_cast<const uint8_t*>(d_src),
-                 static_cast<uint8_t*>(d_dst),
-                 cfg,
-                 d_comp_size);
+    static_cast<nvcomp::GdeflateManager&>(*mgr_cache).compress(
+        static_cast<const uint8_t*>(d_src),
+        static_cast<uint8_t*>(d_dst),
+        cfg,
+        d_comp_size);
   }
 
   void decompress_dd(const void* d_comp, size_t comp_n,

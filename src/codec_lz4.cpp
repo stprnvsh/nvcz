@@ -13,6 +13,8 @@ namespace nvcz {
 struct NvcompLZ4 : Codec {
   const size_t chunk_size;
   const bool enable_checksum;
+  // Persistent manager for this codec instance (single stream usage)
+  std::shared_ptr<nvcomp::nvcompManagerBase> mgr_cache;
 
   NvcompLZ4(size_t chunk_size_kb, bool enable_checksum)
     : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
@@ -132,19 +134,17 @@ struct NvcompLZ4 : Codec {
         nvcomp::ChecksumPolicy::ComputeAndVerify :
         nvcomp::ChecksumPolicy::NoComputeNoVerify;
 
-    nvcomp::LZ4Manager mgr{
-        chunk_size,
-        opts,
-        s,
-        checksum_policy,
-        nvcomp::BitstreamKind::NVCOMP_NATIVE};
+    if (!mgr_cache) {
+      mgr_cache = std::make_shared<nvcomp::LZ4Manager>(
+          chunk_size, opts, s, checksum_policy, nvcomp::BitstreamKind::NVCOMP_NATIVE);
+    }
+    nvcomp::CompressionConfig cfg = static_cast<nvcomp::LZ4Manager&>(*mgr_cache).configure_compression(n);
 
-    nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
-
-    mgr.compress(static_cast<const uint8_t*>(d_src),
-                 static_cast<uint8_t*>(d_dst),
-                 cfg,
-                 d_comp_size);
+    static_cast<nvcomp::LZ4Manager&>(*mgr_cache).compress(
+        static_cast<const uint8_t*>(d_src),
+        static_cast<uint8_t*>(d_dst),
+        cfg,
+        d_comp_size);
   }
 
   // Device-to-device decompress using persistent buffers supplied by the caller.
@@ -156,7 +156,6 @@ struct NvcompLZ4 : Codec {
         nvcomp::create_manager(static_cast<const uint8_t*>(d_comp), s);
     nvcomp::DecompressionConfig dcfg =
         mgr->configure_decompression(static_cast<const uint8_t*>(d_comp), /*comp_size*/ nullptr);
-
     mgr->decompress(static_cast<uint8_t*>(d_dst),
                     static_cast<const uint8_t*>(d_comp),
                     dcfg,

@@ -510,6 +510,11 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
     workers.emplace_back([&, gpu_id]{
       try {
         cuda_ck(cudaSetDevice(gpu_id), "set device");
+        // Configure device mempool for fast stream-ordered allocations
+        cudaMemPool_t pool{};
+        cuda_ck(cudaDeviceGetDefaultMemPool(&pool, gpu_id), "get default mempool");
+        unsigned long long thr = ~0ull; // keep memory in pool
+        cuda_ck(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr), "set mempool threshold");
         auto codec = make_codec(algo, 64);
         if (!codec) die("codec not available in worker");
 
@@ -540,7 +545,7 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
 
           // Allocate per-job device output buffer
           void* d_out_job = nullptr;
-          cuda_ck(cudaMalloc(&d_out_job, BOUND), "mgpu gds d_out job");
+          cuda_ck(cudaMallocAsync(&d_out_job, BOUND, s), "mgpu gds d_out job");
 
           // Compress device-to-device
           codec->compress_dd(d_in[lane], j.n, d_out_job, s, d_sizes[lane]);
@@ -589,7 +594,7 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
         // payload: direct GPU->file write via GDS (zero-copy)
         ssize_t w = gds_out.write_from_gpu(rr.d_comp_dev, comp_len, writer_off);
         if (w != (ssize_t)comp_len) die("cuFileWrite (mgpu gds)");
-        // free per-job device buffer after event
+        // free per-job device buffer after event (synchronous to avoid exit races)
         cuda_ck(cudaFree(rr.d_comp_dev), "free d_out job");
         writer_off += comp_len;
         output_bytes.fetch_add(sizeof(raw_len)+sizeof(comp_len)+comp_len);
@@ -622,6 +627,9 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
   for (auto& th: workers) th.join();
   q_results.close();
   writer.join();
+
+  // Ensure all device work and frees are complete before exit
+  cuda_ck(cudaDeviceSynchronize(), "mgpu gds device sync");
 
   if (any_error.load()) die("MGPU GDS compress failed");
 }

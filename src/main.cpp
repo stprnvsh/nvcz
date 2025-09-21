@@ -94,13 +94,18 @@ static void cmd_compress_gds(Algo algo, uint32_t chunk_mb, size_t nvcomp_chunk_k
   const size_t CHUNK = size_t(chunk_mb) * 1024 * 1024;
   const size_t WORST = codec->max_compressed_bound(CHUNK);
 
-  // Device buffers + size ptr
-  void* d_in=nullptr;  void* d_out=nullptr;  size_t* d_sz=nullptr;  void* d_hdr=nullptr;
-  cuda_ck(cudaMalloc(&d_in, CHUNK), "gds d_in");
-  cuda_ck(cudaMalloc(&d_out, WORST), "gds d_out");
-  cuda_ck(cudaMalloc(&d_sz, sizeof(size_t)), "gds d_sz");
-  cuda_ck(cudaMalloc(&d_hdr, 16), "gds d_hdr");
+  // Device buffers + size ptr (use stream-ordered allocations and mempool)
   cudaStream_t s; cuda_ck(cudaStreamCreate(&s), "gds stream");
+  {
+    int dev=0; cuda_ck(cudaGetDevice(&dev), "get device");
+    cudaMemPool_t pool{}; cuda_ck(cudaDeviceGetDefaultMemPool(&pool, dev), "get mempool");
+    unsigned long long thr = ~0ull; cuda_ck(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr), "set mempool threshold");
+  }
+  void* d_in=nullptr;  void* d_out=nullptr;  size_t* d_sz=nullptr;  void* d_hdr=nullptr;
+  cuda_ck(cudaMallocAsync(&d_in, CHUNK, s), "gds d_in");
+  cuda_ck(cudaMallocAsync(&d_out, WORST, s), "gds d_out");
+  cuda_ck(cudaMallocAsync((void**)&d_sz, sizeof(size_t), s), "gds d_sz");
+  cuda_ck(cudaMallocAsync(&d_hdr, 16, s), "gds d_hdr");
 
   size_t comp_len_host=0;
 
@@ -141,6 +146,11 @@ static void cmd_compress_gds(Algo algo, uint32_t chunk_mb, size_t nvcomp_chunk_k
   uint64_t z=0; if (::pwrite(out_fd, &z, 8, out_off) != 8) die("pwrite z1"); out_off+=8;
   if (::pwrite(out_fd, &z, 8, out_off) != 8) die("pwrite z2"); out_off+=8; output_bytes.fetch_add(16);
 
+  // Ensure all work is done before tearing down nvCOMP manager and stream
+  cuda_ck(cudaStreamSynchronize(s), "gds cleanup sync");
+  // Destroy codec (nvCOMP manager) while stream/context are alive
+  codec.reset();
+  // Free device buffers and destroy stream
   cudaFree(d_in); cudaFree(d_out); cudaFree(d_sz); cudaFree(d_hdr);
   cudaStreamDestroy(s);
 
