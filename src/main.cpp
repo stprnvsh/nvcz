@@ -14,6 +14,10 @@
 #include <cstring>
 #include <fstream>
 #include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <iostream>
 
 using namespace nvcz;
 
@@ -22,17 +26,17 @@ static void usage() {
     "nvcz: stream compressor using nvCOMP (LZ4, GDeflate, Snappy, Zstd)\n"
     "Usage:\n"
     "  nvcz compress --algo {lz4|gdeflate|snappy|zstd} [--chunk-mb N] [--nvcomp-chunk-kb N] [--auto] [--streams N]\n"
-    "                [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size]\n"
+    "                [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size] [--progress]\n"
     "                [-i input_file] [-o output_file] [input_files...]\n"
-    "  nvcz decompress [--auto] [--streams N]\n"
+    "  nvcz decompress [--auto] [--streams N] [--progress]\n"
     "                  [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size]\n"
     "                  [-i input_file] [-o output_file] [input_files...]\n"
     "Examples:\n"
-    "  cat in.bin | nvcz compress --algo lz4 --auto > out.nvcz\n"
-    "  nvcz decompress < out.nvcz > out.bin\n"
-    "  nvcz compress --algo lz4 -i input.bin -o output.nvcz\n"
-    "  nvcz decompress -i input.nvcz -o output.bin\n"
-    "  nvcz compress --algo gdeflate --nvcomp-chunk-kb 256 --mgpu --gpus 0,1 -i big.bin -o big.nvcz\n");
+    "  cat in.bin | nvcz compress --algo lz4 --auto --progress > out.nvcz\n"
+    "  nvcz decompress --progress < out.nvcz > out.bin\n"
+    "  nvcz compress --algo lz4 -i input.bin -o output.nvcz --progress\n"
+    "  nvcz decompress -i input.nvcz -o output.bin --progress\n"
+    "  nvcz compress --algo gdeflate --nvcomp-chunk-kb 256 --mgpu --gpus 0,1 -i big.bin -o big.nvcz --progress\n");
 }
 
 static Algo parse_algo(const std::string& s) {
@@ -51,7 +55,7 @@ static Algo parse_algo(const std::string& s) {
 //  - Worker/SG path issues cudaMemcpyAsync(host_size <- d_comp_size) and fences with an event.
 //  - Writer reads *(host_size) after event and writes exactly that many bytes.
 
-static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb)
+static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb, bool show_progress, FILE* input_fp)
 {
   AutoTune t{};
   if (auto_tune) t = pick_tuning(/*verbose=*/true);
@@ -62,9 +66,46 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
   auto codec = make_codec(algo, nvcomp_chunk_kb);
   if (!codec) die("codec not available");
 
+  // Progress tracking
+  std::atomic<uint64_t> input_bytes{0};
+  std::atomic<uint64_t> output_bytes{0};
+  std::atomic<uint64_t> chunks_processed{0};
+
   Header h{}; std::memcpy(h.magic, MAGIC, 5);
   h.version = 1; h.algo = (uint8_t)algo; h.chunk_mb = CHUNK_MB;
   nvcz::fwrite_exact(&h, sizeof(h), stdout);
+
+  // Progress reporter thread
+  std::thread progress_thread;
+  std::atomic<bool> progress_running{true};
+
+  if (show_progress) {
+    progress_thread = std::thread([&]() {
+      auto start_time = std::chrono::steady_clock::now();
+
+      while (progress_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Update every second
+
+        uint64_t in = input_bytes.load();
+        uint64_t out = output_bytes.load();
+        uint64_t chunks = chunks_processed.load();
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+
+        if (elapsed > 0) {
+          double in_mb = in / (1024.0 * 1024.0);
+          double out_mb = out / (1024.0 * 1024.0);
+          double ratio = in > 0 ? (double)out / in : 0.0;
+          double speed_in = in / (1024.0 * 1024.0) / elapsed;
+          double speed_out = out / (1024.0 * 1024.0) / elapsed;
+
+          std::fprintf(stderr, "\rProgress: %.1f MB in, %.1f MB out (%.2fx), %.1f MB/s in, %.1f MB/s out, %lu chunks",
+                      in_mb, out_mb, ratio, speed_in, speed_out, chunks);
+          std::fflush(stderr);
+        }
+      }
+    });
+  }
 
   const size_t CHUNK = size_t(CHUNK_MB) * 1024 * 1024;
   const int    SLOTS = 2; // ping/pong per stream
@@ -135,6 +176,10 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
       nvcz::fwrite_exact(&comp_len, sizeof(comp_len), stdout);
       nvcz::fwrite_exact(comp_buffers[j.stream][j.slot].bytes(), comp_len, stdout);
 
+      // Update progress counters
+      output_bytes.fetch_add(sizeof(r) + sizeof(comp_len) + comp_len);
+      chunks_processed.fetch_add(1);
+
       // device size buffers are pre-allocated per stream and reused
 
       write_seq++;
@@ -150,6 +195,8 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
       // read next chunk into pinned buffer
       size_t got = read_chunk_into_ptr(host[i].raw[s].bytes(), CHUNK);
       if (got == 0) { eof = true; continue; }
+
+      input_bytes.fetch_add(got);
 
       // use pre-allocated comp buffer (already sized to worst-case)
 
@@ -188,6 +235,10 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
     nvcz::fwrite_exact(&r, sizeof(r), stdout);
     nvcz::fwrite_exact(&comp_len, sizeof(comp_len), stdout);
     nvcz::fwrite_exact(comp_buffers[j.stream][j.slot].bytes(), comp_len, stdout);
+
+    // Update progress counters
+    output_bytes.fetch_add(sizeof(r) + sizeof(comp_len) + comp_len);
+    chunks_processed.fetch_add(1);
     // device size buffers are pre-allocated per stream and reused
     write_seq++;
     inflight.pop_front();
@@ -195,6 +246,7 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
 
   // trailer
   uint64_t z=0; nvcz::fwrite_exact(&z,8,stdout); nvcz::fwrite_exact(&z,8,stdout);
+  output_bytes.fetch_add(16); // Account for trailer
 
   for (int i=0;i<streams;++i){
     for (int s=0;s<SLOTS;++s){
@@ -208,22 +260,93 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
 
   // comp_buffers will be cleaned up automatically by destructor
   for (auto s : ss) cuda_ck(cudaStreamDestroy(s), "rm stream");
+
+  // Stop progress reporting and show final statistics
+  if (show_progress) {
+    progress_running = false;
+    progress_thread.join();
+
+    // Show final statistics
+    uint64_t final_input = input_bytes.load();
+    uint64_t final_output = output_bytes.load();
+    uint64_t final_chunks = chunks_processed.load();
+
+    double in_mb = final_input / (1024.0 * 1024.0);
+    double out_mb = final_output / (1024.0 * 1024.0);
+    double ratio = final_input > 0 ? (double)final_output / final_input : 0.0;
+
+    std::fprintf(stderr, "\nFinal: %.1f MB in, %.1f MB out (%.2fx), %lu chunks\n",
+                in_mb, out_mb, ratio, final_chunks);
+  }
 }
 
 // ---------------- pinned + overlapped single-GPU decompress ----------------
 
-static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb)
+static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb, bool show_progress, FILE* input_fp)
 {
+  // Progress tracking
+  std::atomic<uint64_t> input_bytes{0};
+  std::atomic<uint64_t> output_bytes{0};
+  std::atomic<uint64_t> chunks_processed{0};
+
   Header h{}; nvcz::fread_exact(&h, sizeof(h), stdin);
+  input_bytes.fetch_add(sizeof(h));
+
   if (std::memcmp(h.magic, MAGIC, 5)!=0 || h.version!=1) die("bad header");
   auto algo = (Algo)h.algo;
 
   AutoTune t{}; if (auto_tune) t = pick_tuning(true);
-  const uint32_t CHUNK_MB = h.chunk_mb; // honor file’s chunk size
+  const uint32_t CHUNK_MB = h.chunk_mb; // honor file's chunk size
   const int streams = cli_streams > 0 ? cli_streams : (auto_tune ? t.streams : 3);
 
   auto codec = make_codec(algo, nvcomp_chunk_kb);
   if (!codec) die("codec not available");
+
+  // Progress reporter thread
+  std::thread progress_thread;
+  std::atomic<bool> progress_running{true};
+
+  if (show_progress) {
+    progress_thread = std::thread([&]() {
+      auto start_time = std::chrono::steady_clock::now();
+
+      // Try to get input file size for percentage calculation
+      uint64_t total_input_size = 0;
+      bool has_total_size = false;
+      // Note: input_fp is captured by reference in the lambda
+      if (input_fp != stdin) {
+        struct stat st;
+        if (fstat(fileno(input_fp), &st) == 0) {
+          total_input_size = st.st_size;
+          has_total_size = true;
+        }
+      }
+
+      while (progress_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Update every 0.5 seconds
+
+        uint64_t in = input_bytes.load();
+        uint64_t out = output_bytes.load();
+        uint64_t chunks = chunks_processed.load();
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+
+        if (elapsed > 0) {
+          double ratio = out > 0 ? (double)in / out : 0.0;
+          double speed_in = in / (1024.0 * 1024.0) / elapsed;
+          double speed_out = out / (1024.0 * 1024.0) / elapsed;
+
+          // Calculate percentage if we know the total size
+          double percentage = 0.0;
+          if (has_total_size && total_input_size > 0) {
+            percentage = static_cast<double>(in) / total_input_size;
+          }
+
+          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks);
+        }
+      }
+    });
+  }
 
   const size_t CHUNK = size_t(CHUNK_MB) * 1024 * 1024;
   const int    SLOTS = 2;
@@ -264,6 +387,11 @@ static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_
       cuda_ck(cudaEventDestroy(j.done), "event destroy (d)");
 
       nvcz::fwrite_exact(host[j.stream].raw[j.slot].bytes(), j.raw_len, stdout);
+
+      // Update progress counters
+      output_bytes.fetch_add(j.raw_len);
+      chunks_processed.fetch_add(1);
+
       write_seq++;
       inflight.pop_front();
     }
@@ -280,11 +408,17 @@ static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_
       if (got_r != sizeof(r) || got_c != sizeof(c)) die("truncated header");
       if (r==0 && c==0) { queued_any = false; goto done_read; }
 
+      // Update input bytes for headers
+      input_bytes.fetch_add(sizeof(r) + sizeof(c));
+
       int s = next_slot[i];
       if (host[i].raw[s].cap  < r) host[i].raw[s].alloc(r);
       if (host[i].comp[s].cap < c) host[i].comp[s].alloc(c);
 
       nvcz::fread_exact(host[i].comp[s].bytes(), c, stdin);
+
+      // Update input bytes for compressed data
+      input_bytes.fetch_add(c);
 
       // launch async decomp
       codec->decompress_with_stream(
@@ -312,11 +446,34 @@ done_read:
     cuda_ck(cudaEventSynchronize(j.done), "drain event (d)");
     cuda_ck(cudaEventDestroy(j.done), "destroy event (d)");
     nvcz::fwrite_exact(host[j.stream].raw[j.slot].bytes(), j.raw_len, stdout);
+
+    // Update progress counters for drained jobs
+    output_bytes.fetch_add(j.raw_len);
+    chunks_processed.fetch_add(1);
+
     write_seq++;
     inflight.pop_front();
   }
 
   for (auto s : ss) cuda_ck(cudaStreamDestroy(s), "rm d stream");
+
+  // Stop progress reporting and show final statistics
+  if (show_progress) {
+    progress_running = false;
+    progress_thread.join();
+
+    // Show final statistics
+    uint64_t final_input = input_bytes.load();
+    uint64_t final_output = output_bytes.load();
+    uint64_t final_chunks = chunks_processed.load();
+
+    double in_mb = final_input / (1024.0 * 1024.0);
+    double out_mb = final_output / (1024.0 * 1024.0);
+    double ratio = final_output > 0 ? (double)final_input / final_output : 0.0;
+
+    std::fprintf(stderr, "\nFinal: %.1f MB in, %.1f MB out (%.2fx), %lu chunks\n",
+                in_mb, out_mb, ratio, final_chunks);
+  }
 }
 
 // ---------------- multi-GPU aware main (CLI with file support) ----------------
@@ -335,6 +492,9 @@ int main(int argc, char** argv)
   std::vector<std::string> input_files;
   FILE* input_fp = stdin;
   FILE* output_fp = stdout;
+
+  // Progress and statistics
+  bool show_progress = false;
 
   // MGPU flags
   bool mgpu=false, auto_size=false;
@@ -379,6 +539,7 @@ int main(int argc, char** argv)
         output_file = argv[++i];
       } else { usage(); return 1; }
     }
+    else if (a=="-p" || a=="--progress") { show_progress = true; }
     else if (a[0] != '-' || a=="--") {
       // Non-option arguments are treated as input files
       input_files.push_back(a);
@@ -427,9 +588,9 @@ int main(int argc, char** argv)
         auto t = pick_mgpu_tuning(base, /*size_aware=*/auto_size,
                                   streams_per_gpu_override, gpu_ids_override);
         if (!auto_tune) t.chunk_mb = chunk_mb;
-        compress_mgpu(parse_algo(algo_str), t, input_fp, output_fp);
+        compress_mgpu(parse_algo(algo_str), t, input_fp, output_fp, show_progress);
       } else {
-        cmd_compress(parse_algo(algo_str), chunk_mb, auto_tune, streams, nvcomp_chunk_kb);
+        cmd_compress(parse_algo(algo_str), chunk_mb, auto_tune, streams, nvcomp_chunk_kb, show_progress, input_fp);
       }
     } else if (mode=="decompress") {
       if (mgpu) {
@@ -437,9 +598,9 @@ int main(int argc, char** argv)
                                   : AutoTune{chunk_mb, std::max(1, streams)};
         auto t = pick_mgpu_tuning(base, /*size_aware=*/auto_size,
                                   streams_per_gpu_override, gpu_ids_override);
-        decompress_mgpu(t, input_fp, output_fp);
+        decompress_mgpu(t, input_fp, output_fp, show_progress);
       } else {
-        cmd_decompress(auto_tune, streams, nvcomp_chunk_kb);
+        cmd_decompress(auto_tune, streams, nvcomp_chunk_kb, show_progress, input_fp);
       }
     } else {
       usage(); return 1;

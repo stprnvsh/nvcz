@@ -28,9 +28,9 @@ MgpuTune pick_mgpu_tuning(const AutoTune& base, bool size_aware, int override_st
                           const std::vector<int>& gpu_ids_override);
 
 // Compress stdin -> stdout in-order using multiple GPUs (same v1 framing)
-void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp = stdin, FILE* output_fp = stdout);
+void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
 
 // Decompress stdin -> stdout in-order using multiple GPUs
-void decompress_mgpu(const MgpuTune& t, FILE* input_fp = stdin, FILE* output_fp = stdout);
+void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
 
 } // namespace nvcz

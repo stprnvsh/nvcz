@@ -17,6 +17,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <iostream>
 
 namespace nvcz {
 
@@ -261,7 +265,7 @@ static void worker_compress(int gpu_id, int streams_per_gpu, Algo algo,
   }
 }
 
-void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp)
+void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress)
 {
   const size_t CHUNK = size_t(t.chunk_mb) * 1024 * 1024;
   const int    NGPU  = (int)t.gpu_ids.size();
@@ -277,6 +281,11 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
   if (!bound_codec) die("codec not available (compress bound)");
   const size_t WORST = bound_codec->max_compressed_bound(CHUNK);
 
+  // Progress tracking
+  std::atomic<uint64_t> input_bytes{0};
+  std::atomic<uint64_t> output_bytes{0};
+  std::atomic<uint64_t> chunks_processed{0};
+
   // global free-lists (comp_free removed since we pre-allocate per-stream)
   FreeList<PinBlock> raw_free;
 
@@ -288,6 +297,51 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
   Queue<JobC> q_jobs;
   Queue<ResC> q_results;
   std::atomic<bool> any_error{false};
+
+  // Progress reporter thread
+  std::thread progress_thread;
+  std::atomic<bool> progress_running{true};
+
+  if (show_progress) {
+    progress_thread = std::thread([&]() {
+      auto start_time = std::chrono::steady_clock::now();
+
+      // Try to get input file size for percentage calculation
+      uint64_t total_input_size = 0;
+      bool has_total_size = false;
+      if (input_fp != stdin) {
+        struct stat st;
+        if (fstat(fileno(input_fp), &st) == 0) {
+          total_input_size = st.st_size;
+          has_total_size = true;
+        }
+      }
+
+      while (progress_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Update every 0.5 seconds
+
+        uint64_t in = input_bytes.load();
+        uint64_t out = output_bytes.load();
+        uint64_t chunks = chunks_processed.load();
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+
+        if (elapsed > 0) {
+          double ratio = out > 0 ? (double)in / out : 0.0;
+          double speed_in = in / (1024.0 * 1024.0) / elapsed;
+          double speed_out = out / (1024.0 * 1024.0) / elapsed;
+
+          // Calculate percentage if we know the total size
+          double percentage = 0.0;
+          if (has_total_size && total_input_size > 0) {
+            percentage = static_cast<double>(in) / total_input_size;
+          }
+
+          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks);
+        }
+      }
+    });
+  }
 
   // workers
   std::vector<std::thread> workers;
@@ -303,12 +357,13 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
     uint64_t idx=0;
     for (;;) {
       PinBlock raw = raw_free.get();
-      size_t got = read_chunk_into_ptr(raw.p, CHUNK);
+      size_t got = read_chunk_into_ptr(raw.p, CHUNK, input_fp);
       raw.n = got;
       if (got == 0) { // return empty and stop
         raw_free.put(std::move(raw));
         break;
       }
+      input_bytes.fetch_add(got);
       JobC j; j.idx = idx++; j.raw = std::move(raw);
       q_jobs.push(std::move(j));
     }
@@ -340,6 +395,10 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
         fwrite_exact(&comp_len, sizeof(comp_len), output_fp);
         fwrite_exact(rr.comp->p, comp_len, output_fp);
 
+        // Update progress counters
+        output_bytes.fetch_add(sizeof(raw_len) + sizeof(comp_len) + comp_len);
+        chunks_processed.fetch_add(1);
+
         // recycle buffers - comp buffer is pre-allocated per-stream and reused
         // Note: rr.d_comp_size and rr.comp_size_host are now pre-allocated per-stream and reused
         // Note: rr.comp is also pre-allocated per-stream and reused (no need to return to pool)
@@ -357,6 +416,7 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
 
     // trailer
     uint64_t z=0; fwrite_exact(&z,8,output_fp); fwrite_exact(&z,8,output_fp);
+    output_bytes.fetch_add(16); // Account for trailer
     try_flush();
   });
 
@@ -364,6 +424,24 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
   for (auto& th : workers) th.join();
   q_results.close();
   writer.join();
+
+  // Stop progress reporting and show final statistics
+  if (show_progress) {
+    progress_running = false;
+    progress_thread.join();
+
+    // Show final statistics
+    uint64_t final_input = input_bytes.load();
+    uint64_t final_output = output_bytes.load();
+    uint64_t final_chunks = chunks_processed.load();
+
+    double in_mb = final_input / (1024.0 * 1024.0);
+    double out_mb = final_output / (1024.0 * 1024.0);
+    double ratio = final_input > 0 ? (double)final_output / final_input : 0.0;
+
+    std::fprintf(stderr, "\nFinal: %.1f MB in, %.1f MB out (%.2fx), %lu chunks\n",
+                in_mb, out_mb, ratio, final_chunks);
+  }
 
   if (any_error.load()) die("MGPU compress failed");
 }
@@ -418,10 +496,16 @@ static void worker_decompress(int gpu_id, int streams_per_gpu, Algo algo,
   }
 }
 
-void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp)
+void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress)
 {
+  // Progress tracking
+  std::atomic<uint64_t> input_bytes{0};
+  std::atomic<uint64_t> output_bytes{0};
+  std::atomic<uint64_t> chunks_processed{0};
+
   // header
   Header h{}; fread_exact(&h, sizeof(h), input_fp);
+  input_bytes.fetch_add(sizeof(h));
   if (std::memcmp(h.magic, MAGIC, 5)!=0 || h.version!=1) die("bad header");
   Algo algo = (Algo)h.algo;
 
@@ -457,6 +541,51 @@ void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp)
                          std::ref(any_error));
   }
 
+  // Progress reporter thread
+  std::thread progress_thread;
+  std::atomic<bool> progress_running{true};
+
+  if (show_progress) {
+    progress_thread = std::thread([&]() {
+      auto start_time = std::chrono::steady_clock::now();
+
+      // Try to get input file size for percentage calculation
+      uint64_t total_input_size = 0;
+      bool has_total_size = false;
+      if (input_fp != stdin) {
+        struct stat st;
+        if (fstat(fileno(input_fp), &st) == 0) {
+          total_input_size = st.st_size;
+          has_total_size = true;
+        }
+      }
+
+      while (progress_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Update every 0.5 seconds
+
+        uint64_t in = input_bytes.load();
+        uint64_t out = output_bytes.load();
+        uint64_t chunks = chunks_processed.load();
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+
+        if (elapsed > 0) {
+          double ratio = out > 0 ? (double)in / out : 0.0;
+          double speed_in = in / (1024.0 * 1024.0) / elapsed;
+          double speed_out = out / (1024.0 * 1024.0) / elapsed;
+
+          // Calculate percentage if we know the total size
+          double percentage = 0.0;
+          if (has_total_size && total_input_size > 0) {
+            percentage = static_cast<double>(in) / total_input_size;
+          }
+
+          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks);
+        }
+      }
+    });
+  }
+
   // dispatcher: read (r,c,data)
   std::thread dispatcher([&](){
     uint64_t idx=0;
@@ -467,10 +596,13 @@ void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp)
       if (got_r != sizeof(r) || got_c != sizeof(c)) die("truncated header");
       if (r==0 && c==0) break;
 
+      input_bytes.fetch_add(sizeof(r) + sizeof(c));
+
       PinBlock comp = comp_free.get();
       if (comp.cap < c) comp.alloc_exact(c);
       fread_exact(comp.p, c, input_fp);
       comp.n = c;
+      input_bytes.fetch_add(c);
 
       JobD j; j.idx = idx++; j.raw_n = r; j.comp = std::move(comp);
       q_jobs.push(std::move(j));
@@ -494,6 +626,10 @@ void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp)
 
         fwrite_exact(rr.raw.p, rr.raw.n, output_fp);
 
+        // Update progress counters
+        output_bytes.fetch_add(rr.raw.n);
+        chunks_processed.fetch_add(1);
+
         comp_free.put(std::move(rr.comp));
         raw_free.put(std::move(rr.raw));
 
@@ -513,6 +649,24 @@ void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp)
   for (auto& th : workers) th.join();
   q_results.close();
   writer.join();
+
+  // Stop progress reporting and show final statistics
+  if (show_progress) {
+    progress_running = false;
+    progress_thread.join();
+
+    // Show final statistics
+    uint64_t final_input = input_bytes.load();
+    uint64_t final_output = output_bytes.load();
+    uint64_t final_chunks = chunks_processed.load();
+
+    double in_mb = final_input / (1024.0 * 1024.0);
+    double out_mb = final_output / (1024.0 * 1024.0);
+    double ratio = final_output > 0 ? (double)final_input / final_output : 0.0;
+
+    std::fprintf(stderr, "\nFinal: %.1f MB in, %.1f MB out (%.2fx), %lu chunks\n",
+                in_mb, out_mb, ratio, final_chunks);
+  }
 
   if (any_error.load()) die("MGPU decompress failed");
 }
