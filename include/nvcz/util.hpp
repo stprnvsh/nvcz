@@ -68,10 +68,10 @@ inline void fread_exact(void* p, size_t n, FILE* f = stdin) {
 }
 
 // Modern name we used in new main:
-inline size_t read_chunk_into_ptr(uint8_t* dst, size_t max_n) {
+inline size_t read_chunk_into_ptr(uint8_t* dst, size_t max_n, FILE* f = stdin) {
   size_t total = 0;
   while (total < max_n) {
-    size_t got = std::fread(dst + total, 1, max_n - total, stdin);
+    size_t got = std::fread(dst + total, 1, max_n - total, f);
     total += got;
     if (got == 0) break; // EOF or short read
   }

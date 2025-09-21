@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <deque>
 #include <cstring>
+#include <fstream>
+#include <unistd.h>
 
 using namespace nvcz;
 
@@ -21,12 +23,16 @@ static void usage() {
     "Usage:\n"
     "  nvcz compress --algo {lz4|gdeflate|snappy|zstd} [--chunk-mb N] [--nvcomp-chunk-kb N] [--auto] [--streams N]\n"
     "                [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size]\n"
+    "                [-i input_file] [-o output_file] [input_files...]\n"
     "  nvcz decompress [--auto] [--streams N]\n"
     "                  [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size]\n"
+    "                  [-i input_file] [-o output_file] [input_files...]\n"
     "Examples:\n"
     "  cat in.bin | nvcz compress --algo lz4 --auto > out.nvcz\n"
     "  nvcz decompress < out.nvcz > out.bin\n"
-    "  cat big.bin | nvcz compress --algo gdeflate --nvcomp-chunk-kb 256 --mgpu --gpus 0,1 > big.nvcz\n");
+    "  nvcz compress --algo lz4 -i input.bin -o output.nvcz\n"
+    "  nvcz decompress -i input.nvcz -o output.bin\n"
+    "  nvcz compress --algo gdeflate --nvcomp-chunk-kb 256 --mgpu --gpus 0,1 -i big.bin -o big.nvcz\n");
 }
 
 static Algo parse_algo(const std::string& s) {
@@ -313,7 +319,7 @@ done_read:
   for (auto s : ss) cuda_ck(cudaStreamDestroy(s), "rm d stream");
 }
 
-// ---------------- multi-GPU aware main (CLI unchanged) ----------------
+// ---------------- multi-GPU aware main (CLI with file support) ----------------
 
 int main(int argc, char** argv)
 {
@@ -323,6 +329,12 @@ int main(int argc, char** argv)
   uint32_t chunk_mb = 32;
   bool auto_tune=false; int streams=0;
   size_t nvcomp_chunk_kb = 64;  // Default 64KB nvCOMP chunks
+
+  // File I/O
+  std::string input_file, output_file;
+  std::vector<std::string> input_files;
+  FILE* input_fp = stdin;
+  FILE* output_fp = stdout;
 
   // MGPU flags
   bool mgpu=false, auto_size=false;
@@ -351,7 +363,60 @@ int main(int argc, char** argv)
           pos = comma+1;
         }
       }
-    } else { usage(); return 1; }
+    }
+    else if (a=="-i" || a=="--input") {
+      if (i+1<argc) {
+        std::string file = argv[++i];
+        if (input_file.empty()) {
+          input_file = file;
+        }
+        input_files.push_back(file);
+      } else { usage(); return 1; }
+    }
+    else if (a=="-o" || a=="--output") {
+      if (i+1<argc) {
+        if (!output_file.empty()) { usage(); return 1; } // Only one output file allowed
+        output_file = argv[++i];
+      } else { usage(); return 1; }
+    }
+    else if (a[0] != '-' || a=="--") {
+      // Non-option arguments are treated as input files
+      input_files.push_back(a);
+    }
+    else { usage(); return 1; }
+  }
+
+  // Handle file I/O
+  if (!input_files.empty()) {
+    // Multiple input files - open the first one for now, we'll need to modify functions to handle multiple files
+    input_fp = std::fopen(input_files[0].c_str(), "rb");
+    if (!input_fp) {
+      std::fprintf(stderr, "Error opening input file: %s\n", input_files[0].c_str());
+      return 1;
+    }
+  }
+
+  if (!output_file.empty()) {
+    output_fp = std::fopen(output_file.c_str(), "wb");
+    if (!output_fp) {
+      std::fprintf(stderr, "Error opening output file: %s\n", output_file.c_str());
+      if (input_fp != stdin) std::fclose(input_fp);
+      return 1;
+    }
+  }
+
+  // Redirect stdout/stdin if files are specified
+  if (output_fp != stdout) {
+    if (dup2(fileno(output_fp), fileno(stdout)) == -1) {
+      std::fprintf(stderr, "Error redirecting stdout\n");
+      return 1;
+    }
+  }
+  if (input_fp != stdin) {
+    if (dup2(fileno(input_fp), fileno(stdin)) == -1) {
+      std::fprintf(stderr, "Error redirecting stdin\n");
+      return 1;
+    }
   }
 
   try {
@@ -362,7 +427,7 @@ int main(int argc, char** argv)
         auto t = pick_mgpu_tuning(base, /*size_aware=*/auto_size,
                                   streams_per_gpu_override, gpu_ids_override);
         if (!auto_tune) t.chunk_mb = chunk_mb;
-        compress_mgpu(parse_algo(algo_str), t);
+        compress_mgpu(parse_algo(algo_str), t, input_fp, output_fp);
       } else {
         cmd_compress(parse_algo(algo_str), chunk_mb, auto_tune, streams, nvcomp_chunk_kb);
       }
@@ -372,7 +437,7 @@ int main(int argc, char** argv)
                                   : AutoTune{chunk_mb, std::max(1, streams)};
         auto t = pick_mgpu_tuning(base, /*size_aware=*/auto_size,
                                   streams_per_gpu_override, gpu_ids_override);
-        decompress_mgpu(t);
+        decompress_mgpu(t, input_fp, output_fp);
       } else {
         cmd_decompress(auto_tune, streams, nvcomp_chunk_kb);
       }
@@ -383,5 +448,10 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "fatal: unhandled exception\n");
     return 2;
   }
+
+  // Cleanup file handles
+  if (input_fp != stdin) std::fclose(input_fp);
+  if (output_fp != stdout) std::fclose(output_fp);
+
   return 0;
 }
