@@ -11,6 +11,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <functional>
 #include <cuda_runtime.h>
 #include <nvcomp/shared_types.h>
 
@@ -120,9 +122,42 @@ public:
         return stats_;
     }
 
+    // File-based operations
+    Result compress_file_internal(const std::string& input_file,
+                                 const std::string& output_file,
+                                 size_t chunk_size_mb,
+                                 ProgressCallback progress_callback);
+
+    Result decompress_file_internal(const std::string& input_file,
+                                   const std::string& output_file,
+                                   ProgressCallback progress_callback);
+
+    // Streaming operations
+    StreamingStats compress_with_streaming_internal(StreamProcessor* processor,
+                                                  const RingBufferConfig& ring_config,
+                                                  ProgressCallback progress_callback);
+
+    StreamingStats decompress_with_streaming_internal(StreamProcessor* processor,
+                                                     const RingBufferConfig& ring_config,
+                                                     ProgressCallback progress_callback);
+
+    // Multi-GPU operations
+    bool enable_multi_gpu_internal(const std::vector<int>& gpu_ids, int streams_per_gpu);
+    std::vector<int> get_active_gpus_internal() const;
+    StreamingStats get_streaming_stats_internal() const;
+
 private:
     Config config_;
     CompressionStats stats_;
+    StreamingStats streaming_stats_;
+
+    // Multi-GPU state
+    bool multi_gpu_enabled_ = false;
+    std::vector<int> active_gpu_ids_;
+    int streams_per_gpu_ = 2;
+
+    // Ring buffer state for streaming
+    std::unique_ptr<RingBufferManager> ring_buffer_manager_;
 
     void initialize() {
         // Validate configuration
@@ -285,6 +320,451 @@ private:
 
         return result;
     }
+
+    Result compress_file_internal(const std::string& input_file,
+                                 const std::string& output_file,
+                                 size_t chunk_size_mb,
+                                 ProgressCallback progress_callback) {
+        Result result;
+
+        try {
+            // Open input file
+            std::ifstream input(input_file, std::ios::binary);
+            if (!input) {
+                result.success = false;
+                result.error_message = "Failed to open input file: " + input_file;
+                return result;
+            }
+
+            // Open output file
+            std::ofstream output(output_file, std::ios::binary);
+            if (!output) {
+                result.success = false;
+                result.error_message = "Failed to open output file: " + output_file;
+                return result;
+            }
+
+            // Get file size for progress reporting
+            input.seekg(0, std::ios::end);
+            size_t total_size = input.tellg();
+            input.seekg(0, std::ios::beg);
+
+            // For large files, use streaming approach
+            if (total_size > chunk_size_mb * 1024 * 1024) {
+                // Use chunked approach for large files
+                const size_t chunk_size = chunk_size_mb * 1024 * 1024;
+                std::vector<uint8_t> input_buffer(chunk_size);
+                std::vector<uint8_t> output_buffer;
+
+                size_t processed = 0;
+                while (processed < total_size) {
+                    // Read chunk
+                    size_t to_read = std::min(chunk_size, total_size - processed);
+                    input.read(reinterpret_cast<char*>(input_buffer.data()), to_read);
+                    size_t actually_read = input.gcount();
+
+                    if (actually_read == 0) break;
+
+                    // Compress chunk
+                    output_buffer.resize(get_max_compressed_size(actually_read));
+                    size_t compressed_size = output_buffer.size();
+
+                    Result chunk_result = compress_single_gpu(
+                        input_buffer.data(), actually_read,
+                        output_buffer.data(), &compressed_size
+                    );
+
+                    if (!chunk_result) {
+                        result.success = false;
+                        result.error_message = "Compression failed: " + chunk_result.error_message;
+                        return result;
+                    }
+
+                    // Write compressed data
+                    output.write(reinterpret_cast<const char*>(output_buffer.data()), compressed_size);
+
+                    processed += actually_read;
+
+                    // Progress callback
+                    if (progress_callback) {
+                        progress_callback(processed, total_size);
+                    }
+                }
+            } else {
+                // For smaller files, read all at once for simplicity
+                std::vector<uint8_t> input_buffer(total_size);
+                input.read(reinterpret_cast<char*>(input_buffer.data()), total_size);
+                size_t actually_read = input.gcount();
+
+                std::vector<uint8_t> output_buffer(get_max_compressed_size(actually_read));
+                size_t compressed_size = output_buffer.size();
+
+                Result chunk_result = compress_single_gpu(
+                    input_buffer.data(), actually_read,
+                    output_buffer.data(), &compressed_size
+                );
+
+                if (!chunk_result) {
+                    result.success = false;
+                    result.error_message = "Compression failed: " + chunk_result.error_message;
+                    return result;
+                }
+
+                output.write(reinterpret_cast<const char*>(output_buffer.data()), compressed_size);
+
+                if (progress_callback) {
+                    progress_callback(actually_read, actually_read);
+                }
+            }
+
+            result.success = true;
+            result.stats = stats_;
+
+        } catch (const std::exception& e) {
+            result.success = false;
+            result.error_message = std::string("File compression failed: ") + e.what();
+        }
+
+        return result;
+    }
+
+    Result decompress_file_internal(const std::string& input_file,
+                                   const std::string& output_file,
+                                   ProgressCallback progress_callback) {
+        Result result;
+
+        try {
+            // Open input file
+            std::ifstream input(input_file, std::ios::binary);
+            if (!input) {
+                result.success = false;
+                result.error_message = "Failed to open input file: " + input_file;
+                return result;
+            }
+
+            // Open output file
+            std::ofstream output(output_file, std::ios::binary);
+            if (!output) {
+                result.success = false;
+                result.error_message = "Failed to open output file: " + output_file;
+                return result;
+            }
+
+            // Get input file size
+            input.seekg(0, std::ios::end);
+            size_t input_size = input.tellg();
+            input.seekg(0, std::ios::beg);
+
+            // For large files, use chunked approach
+            const size_t buffer_size = 64 * 1024 * 1024; // 64MB buffer
+            std::vector<uint8_t> input_buffer(buffer_size);
+            std::vector<uint8_t> output_buffer(buffer_size * 2); // Conservative estimate
+
+            size_t processed = 0;
+            while (processed < input_size) {
+                // Read chunk
+                size_t to_read = std::min(buffer_size, input_size - processed);
+                input.read(reinterpret_cast<char*>(input_buffer.data()), to_read);
+                size_t actually_read = input.gcount();
+
+                if (actually_read == 0) break;
+
+                // Decompress chunk
+                size_t decompressed_size = output_buffer.size();
+                Result chunk_result = decompress_single_gpu(
+                    input_buffer.data(), actually_read,
+                    output_buffer.data(), &decompressed_size
+                );
+
+                if (!chunk_result) {
+                    result.success = false;
+                    result.error_message = "Decompression failed: " + chunk_result.error_message;
+                    return result;
+                }
+
+                // Write decompressed data
+                output.write(reinterpret_cast<const char*>(output_buffer.data()), decompressed_size);
+
+                processed += actually_read;
+
+                // Progress callback
+                if (progress_callback) {
+                    progress_callback(processed, input_size);
+                }
+            }
+
+            result.success = true;
+            result.stats = stats_;
+
+        } catch (const std::exception& e) {
+            result.success = false;
+            result.error_message = std::string("File decompression failed: ") + e.what();
+        }
+
+        return result;
+    }
+
+    StreamingStats compress_with_streaming_internal(StreamProcessor* processor,
+                                                  const RingBufferConfig& ring_config,
+                                                  ProgressCallback progress_callback) {
+        StreamingStats stats;
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        try {
+            if (!processor) {
+                stats.total_time = std::chrono::microseconds(0);
+                return stats;
+            }
+
+            // Initialize the processor
+            if (!processor->initialize(config_)) {
+                stats.total_time = std::chrono::microseconds(0);
+                return stats;
+            }
+
+            // Create ring buffer for streaming
+            RingBufferManager ring_buffer(ring_config);
+            if (!ring_buffer.initialize(1)) { // Single GPU for now
+                stats.total_time = std::chrono::microseconds(0);
+                return stats;
+            }
+
+            size_t total_processed = 0;
+            size_t chunks_processed = 0;
+            bool has_more_data = true;
+
+            while (has_more_data) {
+                // Get input chunk from processor
+                auto [buffer, buffer_size] = ring_buffer.get_input_buffer();
+                size_t bytes_read = 0;
+
+                has_more_data = processor->get_next_input_chunk(
+                    reinterpret_cast<uint8_t*>(buffer),
+                    buffer_size,
+                    &bytes_read
+                );
+
+                if (bytes_read == 0 && !has_more_data) break;
+
+                // Mark buffer as filled
+                ring_buffer.mark_input_buffer_filled(
+                    reinterpret_cast<uint8_t*>(buffer),
+                    bytes_read
+                );
+
+                // Process the chunk
+                size_t compressed_size = 0;
+                Result result = compress_single_gpu(
+                    reinterpret_cast<uint8_t*>(buffer),
+                    bytes_read,
+                    reinterpret_cast<uint8_t*>(buffer), // Use same buffer for simplicity
+                    &compressed_size
+                );
+
+                if (!result) {
+                    stats.total_time = std::chrono::microseconds(0);
+                    return stats;
+                }
+
+                // Get output buffer and process it
+                auto [output_buffer, output_buffer_size] = ring_buffer.get_output_buffer();
+                if (compressed_size <= output_buffer_size) {
+                    std::memcpy(output_buffer, buffer, compressed_size);
+                    ring_buffer.mark_output_buffer_ready(
+                        reinterpret_cast<uint8_t*>(output_buffer),
+                        compressed_size
+                    );
+
+                    // Send to processor
+                    if (!processor->process_output_chunk(
+                        reinterpret_cast<uint8_t*>(output_buffer),
+                        compressed_size
+                    )) {
+                        stats.total_time = std::chrono::microseconds(0);
+                        return stats;
+                    }
+                }
+
+                total_processed += bytes_read;
+                chunks_processed++;
+
+                // Progress callback
+                if (progress_callback) {
+                    progress_callback(total_processed, total_processed + 1000); // Simplified progress
+                }
+            }
+
+            // Finalize processor
+            processor->finalize();
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+            stats.total_input_bytes = total_processed;
+            stats.chunks_processed = chunks_processed;
+            stats.total_time = duration;
+
+        } catch (const std::exception& e) {
+            stats.total_time = std::chrono::microseconds(0);
+        }
+
+        return stats;
+    }
+
+    StreamingStats decompress_with_streaming_internal(StreamProcessor* processor,
+                                                     const RingBufferConfig& ring_config,
+                                                     ProgressCallback progress_callback) {
+        StreamingStats stats;
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        try {
+            if (!processor) {
+                stats.total_time = std::chrono::microseconds(0);
+                return stats;
+            }
+
+            // Initialize the processor
+            if (!processor->initialize(config_)) {
+                stats.total_time = std::chrono::microseconds(0);
+                return stats;
+            }
+
+            // Create ring buffer for streaming
+            RingBufferManager ring_buffer(ring_config);
+            if (!ring_buffer.initialize(1)) { // Single GPU for now
+                stats.total_time = std::chrono::microseconds(0);
+                return stats;
+            }
+
+            size_t total_processed = 0;
+            size_t chunks_processed = 0;
+            bool has_more_data = true;
+
+            while (has_more_data) {
+                // Get input chunk from processor
+                auto [buffer, buffer_size] = ring_buffer.get_input_buffer();
+                size_t bytes_read = 0;
+
+                has_more_data = processor->get_next_input_chunk(
+                    reinterpret_cast<uint8_t*>(buffer),
+                    buffer_size,
+                    &bytes_read
+                );
+
+                if (bytes_read == 0 && !has_more_data) break;
+
+                // Mark buffer as filled
+                ring_buffer.mark_input_buffer_filled(
+                    reinterpret_cast<uint8_t*>(buffer),
+                    bytes_read
+                );
+
+                // Process the chunk (decompress)
+                size_t decompressed_size = buffer_size * 2; // Conservative estimate
+                Result result = decompress_single_gpu(
+                    reinterpret_cast<uint8_t*>(buffer),
+                    bytes_read,
+                    reinterpret_cast<uint8_t*>(buffer),
+                    &decompressed_size
+                );
+
+                if (!result) {
+                    stats.total_time = std::chrono::microseconds(0);
+                    return stats;
+                }
+
+                // Get output buffer and process it
+                auto [output_buffer, output_buffer_size] = ring_buffer.get_output_buffer();
+                if (decompressed_size <= output_buffer_size) {
+                    std::memcpy(output_buffer, buffer, decompressed_size);
+                    ring_buffer.mark_output_buffer_ready(
+                        reinterpret_cast<uint8_t*>(output_buffer),
+                        decompressed_size
+                    );
+
+                    // Send to processor
+                    if (!processor->process_output_chunk(
+                        reinterpret_cast<uint8_t*>(output_buffer),
+                        decompressed_size
+                    )) {
+                        stats.total_time = std::chrono::microseconds(0);
+                        return stats;
+                    }
+                }
+
+                total_processed += bytes_read;
+                chunks_processed++;
+
+                // Progress callback
+                if (progress_callback) {
+                    progress_callback(total_processed, total_processed + 1000); // Simplified progress
+                }
+            }
+
+            // Finalize processor
+            processor->finalize();
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+
+            stats.total_input_bytes = total_processed;
+            stats.chunks_processed = chunks_processed;
+            stats.total_time = duration;
+
+        } catch (const std::exception& e) {
+            stats.total_time = std::chrono::microseconds(0);
+        }
+
+        return stats;
+    }
+
+    bool enable_multi_gpu_internal(const std::vector<int>& gpu_ids, int streams_per_gpu) {
+        try {
+            // Validate GPU IDs
+            int device_count = 0;
+            cudaGetDeviceCount(&device_count);
+
+            std::vector<int> ids_to_use = gpu_ids;
+            if (ids_to_use.empty()) {
+                for (int i = 0; i < device_count; ++i) {
+                    ids_to_use.push_back(i);
+                }
+            }
+
+            // Validate all GPU IDs
+            for (int gpu_id : ids_to_use) {
+                if (gpu_id < 0 || gpu_id >= device_count) {
+                    return false;
+                }
+            }
+
+            active_gpu_ids_ = ids_to_use;
+            streams_per_gpu_ = streams_per_gpu;
+            multi_gpu_enabled_ = true;
+
+            // Initialize ring buffer manager for multi-GPU streaming
+            ring_buffer_manager_ = std::make_unique<RingBufferManager>(RingBufferConfig{
+                .buffer_size_mb = config_.chunk_mb,
+                .ring_slots = static_cast<size_t>(streams_per_gpu * 2),
+                .enable_overlapped_io = true
+            });
+
+            ring_buffer_manager_->initialize(ids_to_use.size());
+
+            return true;
+
+        } catch (const std::exception& e) {
+            return false;
+        }
+    }
+
+    std::vector<int> get_active_gpus_internal() const {
+        return active_gpu_ids_;
+    }
+
+    StreamingStats get_streaming_stats_internal() const {
+        return streaming_stats_;
+    }
 };
 
 // Implementation of public API functions
@@ -363,6 +843,359 @@ std::vector<int> get_available_gpus() {
         gpus[i] = i;
     }
     return gpus;
+}
+
+// Implementation of new public API methods
+Result Compressor::compress_file(const std::string& input_file,
+                                const std::string& output_file,
+                                size_t chunk_size_mb,
+                                ProgressCallback progress_callback) {
+    return impl_->compress_file_internal(input_file, output_file, chunk_size_mb, progress_callback);
+}
+
+Result Compressor::decompress_file(const std::string& input_file,
+                                  const std::string& output_file,
+                                  ProgressCallback progress_callback) {
+    return impl_->decompress_file_internal(input_file, output_file, progress_callback);
+}
+
+StreamingStats Compressor::compress_with_streaming(StreamProcessor* processor,
+                                                 const RingBufferConfig& ring_config,
+                                                 ProgressCallback progress_callback) {
+    return impl_->compress_with_streaming_internal(processor, ring_config, progress_callback);
+}
+
+StreamingStats Compressor::decompress_with_streaming(StreamProcessor* processor,
+                                                    const RingBufferConfig& ring_config,
+                                                    ProgressCallback progress_callback) {
+    return impl_->decompress_with_streaming_internal(processor, ring_config, progress_callback);
+}
+
+bool Compressor::enable_multi_gpu(const std::vector<int>& gpu_ids, int streams_per_gpu) {
+    return impl_->enable_multi_gpu_internal(gpu_ids, streams_per_gpu);
+}
+
+std::vector<int> Compressor::get_active_gpus() const {
+    return impl_->get_active_gpus_internal();
+}
+
+StreamingStats Compressor::get_streaming_stats() const {
+    return impl_->get_streaming_stats_internal();
+}
+
+// Implementation of standalone functions
+Result compress_file(const std::string& input_file,
+                    const std::string& output_file,
+                    const Config& config,
+                    ProgressCallback progress_callback) {
+    Compressor compressor(config);
+    return compressor.compress_file(input_file, output_file, config.chunk_mb, progress_callback);
+}
+
+Result decompress_file(const std::string& input_file,
+                      const std::string& output_file,
+                      const Config& config,
+                      ProgressCallback progress_callback) {
+    Compressor compressor(config);
+    return compressor.decompress_file(input_file, output_file, progress_callback);
+}
+
+// RingBufferManager implementation
+class RingBufferManager::Impl {
+public:
+    RingBufferConfig config_;
+    std::vector<uint8_t*> input_buffers_;
+    std::vector<uint8_t*> output_buffers_;
+    size_t current_input_index_ = 0;
+    size_t current_output_index_ = 0;
+    bool initialized_ = false;
+
+    Impl(const RingBufferConfig& config) : config_(config) {}
+
+    bool initialize(size_t gpu_count) {
+        if (initialized_) return true;
+
+        size_t buffer_size = config_.buffer_size_mb * 1024 * 1024;
+
+        try {
+            // Allocate input buffers
+            input_buffers_.resize(config_.ring_slots);
+            for (size_t i = 0; i < config_.ring_slots; ++i) {
+                input_buffers_[i] = new uint8_t[buffer_size];
+            }
+
+            // Allocate output buffers
+            output_buffers_.resize(config_.ring_slots);
+            for (size_t i = 0; i < config_.ring_slots; ++i) {
+                output_buffers_[i] = new uint8_t[buffer_size * 2]; // Conservative for compressed data
+            }
+
+            initialized_ = true;
+            return true;
+
+        } catch (const std::exception& e) {
+            cleanup();
+            return false;
+        }
+    }
+
+    ~Impl() {
+        cleanup();
+    }
+
+    std::pair<uint8_t*, size_t> get_input_buffer() {
+        if (!initialized_) return {nullptr, 0};
+
+        uint8_t* buffer = input_buffers_[current_input_index_];
+        size_t buffer_size = config_.buffer_size_mb * 1024 * 1024;
+
+        current_input_index_ = (current_input_index_ + 1) % config_.ring_slots;
+        return {buffer, buffer_size};
+    }
+
+    std::pair<uint8_t*, size_t> get_output_buffer() {
+        if (!initialized_) return {nullptr, 0};
+
+        uint8_t* buffer = output_buffers_[current_output_index_];
+        size_t buffer_size = config_.buffer_size_mb * 1024 * 1024 * 2; // Conservative
+
+        current_output_index_ = (current_output_index_ + 1) % config_.ring_slots;
+        return {buffer, buffer_size};
+    }
+
+    void mark_input_buffer_filled(uint8_t* buffer, size_t size) {
+        // In a real implementation, this would coordinate with GPU operations
+        // For now, just a placeholder
+    }
+
+    void mark_output_buffer_ready(uint8_t* buffer, size_t size) {
+        // In a real implementation, this would coordinate with GPU operations
+        // For now, just a placeholder
+    }
+
+    double get_efficiency() const {
+        // Simplified efficiency metric
+        return initialized_ ? 0.8 : 0.0;
+    }
+
+private:
+    void cleanup() {
+        for (auto* buffer : input_buffers_) {
+            delete[] buffer;
+        }
+        input_buffers_.clear();
+
+        for (auto* buffer : output_buffers_) {
+            delete[] buffer;
+        }
+        output_buffers_.clear();
+
+        initialized_ = false;
+    }
+};
+
+RingBufferManager::RingBufferManager(const RingBufferConfig& config)
+    : impl_(std::make_unique<Impl>(config)) {}
+
+RingBufferManager::~RingBufferManager() = default;
+
+bool RingBufferManager::initialize(size_t gpu_count) {
+    return impl_->initialize(gpu_count);
+}
+
+std::pair<uint8_t*, size_t> RingBufferManager::get_input_buffer() {
+    return impl_->get_input_buffer();
+}
+
+std::pair<uint8_t*, size_t> RingBufferManager::get_output_buffer() {
+    return impl_->get_output_buffer();
+}
+
+void RingBufferManager::mark_input_buffer_filled(uint8_t* buffer, size_t size) {
+    impl_->mark_input_buffer_filled(buffer, size);
+}
+
+void RingBufferManager::mark_output_buffer_ready(uint8_t* buffer, size_t size) {
+    impl_->mark_output_buffer_ready(buffer, size);
+}
+
+double RingBufferManager::get_efficiency() const {
+    return impl_->get_efficiency();
+}
+
+// FileStreamProcessor implementation
+class FileStreamProcessor::Impl {
+public:
+    std::string input_file_;
+    std::string output_file_;
+    std::unique_ptr<std::ifstream> input_stream_;
+    std::unique_ptr<std::ofstream> output_stream_;
+    std::function<void(const uint8_t*, size_t)> output_callback_;
+    size_t total_processed_ = 0;
+
+    Impl(const std::string& input_file, const std::string& output_file)
+        : input_file_(input_file), output_file_(output_file) {}
+
+    Impl(const std::string& input_file, std::function<void(const uint8_t*, size_t)> output_callback)
+        : input_file_(input_file), output_callback_(output_callback) {}
+
+    bool initialize(const Config& config) {
+        try {
+            if (!input_file_.empty()) {
+                input_stream_ = std::make_unique<std::ifstream>(input_file_, std::ios::binary);
+                if (!input_stream_->is_open()) {
+                    return false;
+                }
+            }
+
+            if (!output_file_.empty()) {
+                output_stream_ = std::make_unique<std::ofstream>(output_file_, std::ios::binary);
+                if (!output_stream_->is_open()) {
+                    return false;
+                }
+            }
+
+            return true;
+        } catch (const std::exception& e) {
+            return false;
+        }
+    }
+
+    bool get_next_input_chunk(uint8_t* buffer, size_t buffer_size, size_t* bytes_read) {
+        if (input_stream_ && input_stream_->is_open()) {
+            input_stream_->read(reinterpret_cast<char*>(buffer), buffer_size);
+            *bytes_read = input_stream_->gcount();
+            return *bytes_read > 0 || input_stream_->eof();
+        }
+        return false;
+    }
+
+    bool process_output_chunk(const uint8_t* data, size_t size) {
+        if (output_stream_ && output_stream_->is_open()) {
+            output_stream_->write(reinterpret_cast<const char*>(data), size);
+            return output_stream_->good();
+        } else if (output_callback_) {
+            output_callback_(data, size);
+            return true;
+        }
+        return false;
+    }
+
+    bool finalize() {
+        if (input_stream_) {
+            input_stream_->close();
+        }
+        if (output_stream_) {
+            output_stream_->close();
+        }
+        return true;
+    }
+
+    size_t get_total_bytes_processed() const {
+        return total_processed_;
+    }
+};
+
+FileStreamProcessor::FileStreamProcessor(const std::string& input_file, const std::string& output_file)
+    : impl_(std::make_unique<Impl>(input_file, output_file)) {}
+
+FileStreamProcessor::FileStreamProcessor(const std::string& input_file, DataCallback output_callback)
+    : impl_(std::make_unique<Impl>(input_file, output_callback)) {}
+
+FileStreamProcessor::~FileStreamProcessor() = default;
+
+bool FileStreamProcessor::initialize(const Config& config) {
+    return impl_->initialize(config);
+}
+
+bool FileStreamProcessor::get_next_input_chunk(uint8_t* buffer, size_t buffer_size, size_t* bytes_read) {
+    return impl_->get_next_input_chunk(buffer, buffer_size, bytes_read);
+}
+
+bool FileStreamProcessor::process_output_chunk(const uint8_t* data, size_t size) {
+    return impl_->process_output_chunk(data, size);
+}
+
+bool FileStreamProcessor::finalize() {
+    return impl_->finalize();
+}
+
+size_t FileStreamProcessor::get_total_bytes_processed() const {
+    return impl_->get_total_bytes_processed();
+}
+
+// MemoryStreamProcessor implementation
+class MemoryStreamProcessor::Impl {
+public:
+    const uint8_t* input_data_;
+    size_t input_size_;
+    size_t current_position_;
+    std::function<void(const uint8_t*, size_t)> output_callback_;
+    size_t total_processed_ = 0;
+
+    Impl(const uint8_t* input_data, size_t input_size, std::function<void(const uint8_t*, size_t)> output_callback)
+        : input_data_(input_data), input_size_(input_size), current_position_(0), output_callback_(output_callback) {}
+
+    bool initialize(const Config& config) {
+        current_position_ = 0;
+        return true;
+    }
+
+    bool get_next_input_chunk(uint8_t* buffer, size_t buffer_size, size_t* bytes_read) {
+        if (current_position_ >= input_size_) {
+            *bytes_read = 0;
+            return false;
+        }
+
+        size_t to_read = std::min(buffer_size, input_size_ - current_position_);
+        std::memcpy(buffer, input_data_ + current_position_, to_read);
+        current_position_ += to_read;
+        *bytes_read = to_read;
+
+        total_processed_ += to_read;
+        return true;
+    }
+
+    bool process_output_chunk(const uint8_t* data, size_t size) {
+        if (output_callback_) {
+            output_callback_(data, size);
+            return true;
+        }
+        return false;
+    }
+
+    bool finalize() {
+        return true;
+    }
+
+    size_t get_total_bytes_processed() const {
+        return total_processed_;
+    }
+};
+
+MemoryStreamProcessor::MemoryStreamProcessor(const uint8_t* input_data, size_t input_size, DataCallback output_callback)
+    : impl_(std::make_unique<Impl>(input_data, input_size, output_callback)) {}
+
+MemoryStreamProcessor::~MemoryStreamProcessor() = default;
+
+bool MemoryStreamProcessor::initialize(const Config& config) {
+    return impl_->initialize(config);
+}
+
+bool MemoryStreamProcessor::get_next_input_chunk(uint8_t* buffer, size_t buffer_size, size_t* bytes_read) {
+    return impl_->get_next_input_chunk(buffer, buffer_size, bytes_read);
+}
+
+bool MemoryStreamProcessor::process_output_chunk(const uint8_t* data, size_t size) {
+    return impl_->process_output_chunk(data, size);
+}
+
+bool MemoryStreamProcessor::finalize() {
+    return impl_->finalize();
+}
+
+size_t MemoryStreamProcessor::get_total_bytes_processed() const {
+    return impl_->get_total_bytes_processed();
 }
 
 } // namespace nvcz

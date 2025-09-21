@@ -263,6 +263,12 @@ static void worker_compress(int gpu_id, int streams_per_gpu, Algo algo,
 
 void compress_mgpu(Algo algo, const MgpuTune& t)
 {
+  compress_mgpu_with_files(algo, t, stdin, stdout, nullptr);
+}
+
+void compress_mgpu_with_files(Algo algo, const MgpuTune& t, FILE* input_file, FILE* output_file,
+                             std::function<void(size_t, size_t)> progress_callback)
+{
   const size_t CHUNK = size_t(t.chunk_mb) * 1024 * 1024;
   const int    NGPU  = (int)t.gpu_ids.size();
   const int    RING_PER_GPU = std::max(3, t.streams_per_gpu * 2); // generous per-GPU ring
@@ -270,7 +276,7 @@ void compress_mgpu(Algo algo, const MgpuTune& t)
   // header
   Header h{}; std::memcpy(h.magic, MAGIC, 5);
   h.version = 1; h.algo = (uint8_t)algo; h.chunk_mb = t.chunk_mb;
-  fwrite_exact(&h, sizeof(h), stdout);
+  fwrite_exact(&h, sizeof(h), output_file);
 
   // compute worst bound once
   auto bound_codec = make_codec(algo, 64);  // Use default 64KB chunks for MGPU for now
@@ -298,12 +304,14 @@ void compress_mgpu(Algo algo, const MgpuTune& t)
                          std::ref(any_error));
   }
 
-  // dispatcher: read stdin into raw pinned blocks
+  // dispatcher: read from input file into raw pinned blocks
   std::thread dispatcher([&](){
     uint64_t idx=0;
     for (;;) {
       PinBlock raw = raw_free.get();
-      size_t got = read_chunk_into_ptr(raw.p, CHUNK);
+
+      // Use read_chunk_into_ptr with custom input file if provided
+      size_t got = read_chunk_into_ptr(raw.p, CHUNK, input_file);
       raw.n = got;
       if (got == 0) { // return empty and stop
         raw_free.put(std::move(raw));
@@ -336,9 +344,9 @@ void compress_mgpu(Algo algo, const MgpuTune& t)
         const uint64_t raw_len = rr.raw_n;
 
         // frame + payload
-        fwrite_exact(&raw_len,  sizeof(raw_len),  stdout);
-        fwrite_exact(&comp_len, sizeof(comp_len), stdout);
-        fwrite_exact(rr.comp->p, comp_len, stdout);
+        fwrite_exact(&raw_len,  sizeof(raw_len),  output_file);
+        fwrite_exact(&comp_len, sizeof(comp_len), output_file);
+        fwrite_exact(rr.comp->p, comp_len, output_file);
 
         // recycle buffers - comp buffer is pre-allocated per-stream and reused
         // Note: rr.d_comp_size and rr.comp_size_host are now pre-allocated per-stream and reused
@@ -347,6 +355,13 @@ void compress_mgpu(Algo algo, const MgpuTune& t)
 
         hold.erase(it);
         next++;
+
+        // Progress callback
+        if (progress_callback) {
+          static size_t total_processed = 0;
+          total_processed += raw_len;
+          progress_callback(total_processed, 0); // We don't know total size in streaming mode
+        }
       }
     };
 
@@ -356,7 +371,7 @@ void compress_mgpu(Algo algo, const MgpuTune& t)
     }
 
     // trailer
-    uint64_t z=0; fwrite_exact(&z,8,stdout); fwrite_exact(&z,8,stdout);
+    uint64_t z=0; fwrite_exact(&z,8,output_file); fwrite_exact(&z,8,output_file);
     try_flush();
   });
 
@@ -420,8 +435,14 @@ static void worker_decompress(int gpu_id, int streams_per_gpu, Algo algo,
 
 void decompress_mgpu(const MgpuTune& t)
 {
+  decompress_mgpu_with_files(t, stdin, stdout, nullptr);
+}
+
+void decompress_mgpu_with_files(const MgpuTune& t, FILE* input_file, FILE* output_file,
+                               std::function<void(size_t, size_t)> progress_callback)
+{
   // header
-  Header h{}; fread_exact(&h, sizeof(h), stdin);
+  Header h{}; fread_exact(&h, sizeof(h), input_file);
   if (std::memcmp(h.magic, MAGIC, 5)!=0 || h.version!=1) die("bad header");
   Algo algo = (Algo)h.algo;
 
@@ -462,14 +483,14 @@ void decompress_mgpu(const MgpuTune& t)
     uint64_t idx=0;
     for (;;) {
       uint64_t r=0, c=0;
-      size_t got_r = std::fread(&r,1,sizeof(r),stdin);
-      size_t got_c = std::fread(&c,1,sizeof(c),stdin);
+      size_t got_r = std::fread(&r,1,sizeof(r),input_file);
+      size_t got_c = std::fread(&c,1,sizeof(c),input_file);
       if (got_r != sizeof(r) || got_c != sizeof(c)) die("truncated header");
       if (r==0 && c==0) break;
 
       PinBlock comp = comp_free.get();
       if (comp.cap < c) comp.alloc_exact(c);
-      fread_exact(comp.p, c, stdin);
+      fread_exact(comp.p, c, input_file);
       comp.n = c;
 
       JobD j; j.idx = idx++; j.raw_n = r; j.comp = std::move(comp);
@@ -492,13 +513,20 @@ void decompress_mgpu(const MgpuTune& t)
         cuda_ck(cudaEventSynchronize(rr.done), "evt sync");
         cudaEventDestroy(rr.done);
 
-        fwrite_exact(rr.raw.p, rr.raw.n, stdout);
+        fwrite_exact(rr.raw.p, rr.raw.n, output_file);
 
         comp_free.put(std::move(rr.comp));
         raw_free.put(std::move(rr.raw));
 
         hold.erase(it);
         next++;
+
+        // Progress callback
+        if (progress_callback) {
+          static size_t total_processed = 0;
+          total_processed += rr.raw.n;
+          progress_callback(total_processed, 0); // We don't know total size in streaming mode
+        }
       }
     };
 

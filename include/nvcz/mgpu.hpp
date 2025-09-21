@@ -33,4 +33,13 @@ void compress_mgpu(Algo algo, const MgpuTune& t);
 // Decompress stdin -> stdout in-order using multiple GPUs
 void decompress_mgpu(const MgpuTune& t);
 
+// Enhanced versions with file handles and progress callbacks
+void compress_mgpu_with_files(Algo algo, const MgpuTune& t,
+                             FILE* input_file, FILE* output_file,
+                             std::function<void(size_t, size_t)> progress_callback = nullptr);
+
+void decompress_mgpu_with_files(const MgpuTune& t,
+                               FILE* input_file, FILE* output_file,
+                               std::function<void(size_t, size_t)> progress_callback = nullptr);
+
 } // namespace nvcz
