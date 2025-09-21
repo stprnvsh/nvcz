@@ -43,6 +43,7 @@ bool GDSFile::open(const char* filename, int flags) {
     if (fd_ < 0) {
         return false;
     }
+    owns_fd_ = true;
     
     // Register with cuFile
     CUfileDescr_t desc = {};
@@ -83,7 +84,9 @@ void GDSFile::close() {
     if (!is_open_) return;
     
     cuFileHandleDeregister(handle_);
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (owns_fd_ && fd_ >= 0) { ::close(fd_); }
+    fd_ = -1;
+    owns_fd_ = false;
     
     is_open_ = false;
 }

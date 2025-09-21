@@ -765,6 +765,26 @@ int main(int argc, char** argv)
 
   for (int i=2;i<argc;++i) {
     std::string a = argv[i];
+    // Support --key=value forms
+    auto starts_with = [&](const char* key){ return a.rfind(key, 0) == 0; };
+    if (starts_with("--algo=")) { algo_str = a.substr(std::strlen("--algo=")); continue; }
+    if (starts_with("--chunk-mb=")) { chunk_mb = std::max(1, std::atoi(a.substr(std::strlen("--chunk-mb=")).c_str())); continue; }
+    if (starts_with("--nvcomp-chunk-kb=")) { nvcomp_chunk_kb = std::max(1UL, (size_t)std::atoi(a.substr(std::strlen("--nvcomp-chunk-kb=")).c_str())); continue; }
+    if (starts_with("--streams=")) { streams = std::max(1, std::atoi(a.substr(std::strlen("--streams=")).c_str())); continue; }
+    if (starts_with("--streams-per-gpu=")) { streams_per_gpu_override = std::max(1, std::atoi(a.substr(std::strlen("--streams-per-gpu=")).c_str())); continue; }
+    if (starts_with("--gpus=")) {
+      std::string list = a.substr(std::strlen("--gpus="));
+      if (list != "all") {
+        size_t pos=0;
+        while (pos < list.size()) {
+          size_t comma = list.find(',', pos);
+          int id = std::atoi(list.substr(pos, (comma==std::string::npos? list.size():comma)-pos).c_str());
+          gpu_ids_override.push_back(id);
+          if (comma==std::string::npos) break; pos = comma+1;
+        }
+      }
+      continue;
+    }
     if (a=="--algo" && i+1<argc) { algo_str = argv[++i]; }
     else if (a=="--chunk-mb" && i+1<argc) { chunk_mb = std::max(1, std::atoi(argv[++i])); }
     else if (a=="--nvcomp-chunk-kb" && i+1<argc) { nvcomp_chunk_kb = std::max(1UL, (size_t)std::atoi(argv[++i])); }
@@ -795,11 +815,19 @@ int main(int argc, char** argv)
         input_files.push_back(file);
       } else { usage(); return 1; }
     }
+    else if (starts_with("-i=")) {
+      std::string file = a.substr(std::strlen("-i="));
+      if (input_file.empty()) input_file = file; input_files.push_back(file);
+    }
     else if (a=="-o" || a=="--output") {
       if (i+1<argc) {
         if (!output_file.empty()) { usage(); return 1; } // Only one output file allowed
         output_file = argv[++i];
       } else { usage(); return 1; }
+    }
+    else if (starts_with("-o=")) {
+      if (!output_file.empty()) { usage(); return 1; }
+      output_file = a.substr(std::strlen("-o="));
     }
     else if (a=="-p" || a=="--progress") { show_progress = true; }
     else if (a=="-c" || a=="--checksum") { enable_checksum = true; }

@@ -3,6 +3,7 @@
 #include "nvcz/util.hpp"
 
 #include <memory>
+#include <unordered_map>
 
 #include <nvcomp/snappy.hpp>                // nvcomp::SnappyManager
 #include <nvcomp/nvcompManagerFactory.hpp>  // nvcomp::create_manager
@@ -13,7 +14,20 @@ namespace nvcz {
 struct NvcompSnappy : Codec {
   const size_t chunk_size;
   const bool enable_checksum;
-  std::shared_ptr<nvcomp::nvcompManagerBase> mgr_cache;
+  std::unordered_map<cudaStream_t, std::shared_ptr<nvcomp::nvcompManagerBase>> mgr_by_stream;
+
+  nvcomp::SnappyManager& get_manager(cudaStream_t s) {
+    auto it = mgr_by_stream.find(s);
+    if (it != mgr_by_stream.end()) return static_cast<nvcomp::SnappyManager&>(*it->second);
+    nvcompBatchedSnappyOpts_t opts{};
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+    auto mgr = std::make_shared<nvcomp::SnappyManager>(
+        chunk_size, opts, s, checksum_policy, nvcomp::BitstreamKind::NVCOMP_NATIVE);
+    mgr_by_stream.emplace(s, mgr);
+    return static_cast<nvcomp::SnappyManager&>(*mgr);
+  }
 
   NvcompSnappy(size_t chunk_size_kb, bool enable_checksum)
     : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
@@ -54,11 +68,8 @@ struct NvcompSnappy : Codec {
         nvcomp::ChecksumPolicy::ComputeAndVerify :
         nvcomp::ChecksumPolicy::NoComputeNoVerify;
 
-    if (!mgr_cache) {
-      mgr_cache = std::make_shared<nvcomp::SnappyManager>(
-          chunk_size, opts, s, checksum_policy, nvcomp::BitstreamKind::NVCOMP_NATIVE);
-    }
-    nvcomp::CompressionConfig cfg = static_cast<nvcomp::SnappyManager&>(*mgr_cache).configure_compression(n);
+    auto& mgr = get_manager(s);
+    nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
 
     // Device staging buffers
     void* d_in  = nullptr;
@@ -70,7 +81,7 @@ struct NvcompSnappy : Codec {
     cuda_ck(cudaMemcpyAsync(d_in, src, n, cudaMemcpyHostToDevice, s), "snappy H2D");
 
     // Compress (nvCOMP writes exact size to d_comp_size on device)
-    static_cast<nvcomp::SnappyManager&>(*mgr_cache).compress(
+    get_manager(s).compress(
         static_cast<const uint8_t*>(d_in),
         static_cast<uint8_t*>(d_out),
         cfg,
@@ -146,7 +157,7 @@ struct NvcompSnappy : Codec {
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
 
-    static_cast<nvcomp::SnappyManager&>(*mgr_cache).compress(
+    get_manager(s).compress(
         static_cast<const uint8_t*>(d_src),
         static_cast<uint8_t*>(d_dst),
         cfg,

@@ -3,6 +3,7 @@
 #include "nvcz/util.hpp"
 
 #include <memory>
+#include <unordered_map>
 
 #include <nvcomp/lz4.hpp>                    // nvcomp::LZ4Manager
 #include <nvcomp/nvcompManagerFactory.hpp>   // nvcomp::create_manager
@@ -13,8 +14,21 @@ namespace nvcz {
 struct NvcompLZ4 : Codec {
   const size_t chunk_size;
   const bool enable_checksum;
-  // Persistent manager for this codec instance (single stream usage)
-  std::shared_ptr<nvcomp::nvcompManagerBase> mgr_cache;
+  // Persistent managers per CUDA stream
+  std::unordered_map<cudaStream_t, std::shared_ptr<nvcomp::nvcompManagerBase>> mgr_by_stream;
+
+  nvcomp::LZ4Manager& get_manager(cudaStream_t s) {
+    auto it = mgr_by_stream.find(s);
+    if (it != mgr_by_stream.end()) return static_cast<nvcomp::LZ4Manager&>(*it->second);
+    nvcompBatchedLZ4Opts_t opts{};
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+    auto mgr = std::make_shared<nvcomp::LZ4Manager>(
+        chunk_size, opts, s, checksum_policy, nvcomp::BitstreamKind::NVCOMP_NATIVE);
+    mgr_by_stream.emplace(s, mgr);
+    return static_cast<nvcomp::LZ4Manager&>(*mgr);
+  }
 
   NvcompLZ4(size_t chunk_size_kb, bool enable_checksum)
     : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
@@ -134,13 +148,10 @@ struct NvcompLZ4 : Codec {
         nvcomp::ChecksumPolicy::ComputeAndVerify :
         nvcomp::ChecksumPolicy::NoComputeNoVerify;
 
-    if (!mgr_cache) {
-      mgr_cache = std::make_shared<nvcomp::LZ4Manager>(
-          chunk_size, opts, s, checksum_policy, nvcomp::BitstreamKind::NVCOMP_NATIVE);
-    }
-    nvcomp::CompressionConfig cfg = static_cast<nvcomp::LZ4Manager&>(*mgr_cache).configure_compression(n);
+    auto& mgr = get_manager(s);
+    nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
 
-    static_cast<nvcomp::LZ4Manager&>(*mgr_cache).compress(
+    get_manager(s).compress(
         static_cast<const uint8_t*>(d_src),
         static_cast<uint8_t*>(d_dst),
         cfg,

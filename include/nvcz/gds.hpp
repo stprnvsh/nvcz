@@ -13,6 +13,7 @@ private:
     CUfileHandle_t handle_;
     bool is_open_ = false;
     int fd_ = -1;
+    bool owns_fd_ = false;
     
 public:
     GDSFile() = default;

@@ -472,10 +472,11 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
   const int    NGPU  = (int)t.gpu_ids.size();
   const int    RING_PER_GPU = std::max(3, t.streams_per_gpu * 2);
 
-  // header
+  // header via pwrite on owned output fd
   Header h{}; std::memcpy(h.magic, MAGIC, 5);
   h.version = 1; h.algo = (uint8_t)algo; h.chunk_mb = t.chunk_mb;
-  fwrite_exact(&h, sizeof(h), output_fp);
+  int out_fd = fileno(output_fp);
+  if (::pwrite(out_fd, &h, sizeof(h), 0) != (ssize_t)sizeof(h)) die("pwrite header (mgpu gds)");
 
   // compute worst bound once
   auto bound_codec = make_codec(algo, 64);
@@ -484,9 +485,9 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
 
   // Open GDS on stdin/stdout descriptors if they are regular files
   int in_fd = fileno(input_fp);
-  int out_fd = fileno(output_fp);
+  int out_fd_gds = fileno(output_fp); // Renamed to avoid conflict with out_fd
   nvcz::GDSFile gds_in;  bool gds_in_ok  = gds_in.open_fd(in_fd);
-  nvcz::GDSFile gds_out; bool gds_out_ok = gds_out.open_fd(out_fd);
+  nvcz::GDSFile gds_out; bool gds_out_ok = gds_out.open_fd(out_fd_gds);
   if (!gds_in_ok || !gds_out_ok) die("GDS open failed (mgpu)");
 
   // Progress tracking
@@ -562,6 +563,9 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
           q_results.push(std::move(r));
         }
 
+        // Destroy codec (nvCOMP managers) BEFORE destroying streams to avoid
+        // managers issuing async frees on dead streams
+        codec.reset();
         for (int i=0;i<t.streams_per_gpu;++i){
           if (d_in[i]) cudaFree(d_in[i]);
           if (d_sizes[i]) cudaFreeAsync(d_sizes[i], ss[i]);
@@ -586,15 +590,13 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
         cuda_ck(cudaEventSynchronize(rr.done), "sync"); cudaEventDestroy(rr.done);
         size_t comp_len = *(rr.comp_size_host.p);
         uint64_t raw_len = rr.raw_n;
-        // Write frame header and payload using pwrite (headers) + fwrite payload
+        // Write frame header and payload using pwrite (headers) + GDS payload
         if (::pwrite(out_fd, &raw_len, sizeof(raw_len), writer_off) != (ssize_t)sizeof(raw_len)) die("pwrite r (mgpu gds)");
         writer_off += sizeof(raw_len);
         if (::pwrite(out_fd, &comp_len, sizeof(comp_len), writer_off) != (ssize_t)sizeof(comp_len)) die("pwrite c (mgpu gds)");
         writer_off += sizeof(comp_len);
-        // payload: direct GPU->file write via GDS (zero-copy)
         ssize_t w = gds_out.write_from_gpu(rr.d_comp_dev, comp_len, writer_off);
         if (w != (ssize_t)comp_len) die("cuFileWrite (mgpu gds)");
-        // free per-job device buffer after event (synchronous to avoid exit races)
         cuda_ck(cudaFree(rr.d_comp_dev), "free d_out job");
         writer_off += comp_len;
         output_bytes.fetch_add(sizeof(raw_len)+sizeof(comp_len)+comp_len);
