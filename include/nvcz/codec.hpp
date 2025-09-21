@@ -30,6 +30,16 @@ struct Codec {
   virtual void decompress_with_stream(const uint8_t* comp, size_t comp_n,
                                       uint8_t* dst, size_t raw_n,
                                       cudaStream_t stream) = 0;
+
+  // Optimized path: device-to-device API using persistent GPU buffers (no per-chunk allocs/copies).
+  // Caller is responsible for staging H2D/D2H as needed and for providing adequately-sized device buffers.
+  virtual void compress_dd(const void* d_src, size_t n,
+                           void* d_dst, cudaStream_t stream,
+                           size_t* d_comp_size) = 0;
+
+  virtual void decompress_dd(const void* d_comp, size_t comp_n,
+                             void* d_dst, size_t raw_n,
+                             cudaStream_t stream) = 0;
 };
 
 // Global configuration for nvCOMP chunk size (default 64KB)

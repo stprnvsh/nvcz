@@ -30,7 +30,13 @@ MgpuTune pick_mgpu_tuning(const AutoTune& base, bool size_aware, int override_st
 // Compress stdin -> stdout in-order using multiple GPUs (same v1 framing)
 void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
 
+// Compress using GPUDirect Storage for multi-GPU (reads directly into GPU)
+void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
+
 // Decompress stdin -> stdout in-order using multiple GPUs
 void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
+
+// (Optional) Decompress using GPUDirect Storage (to be implemented later)
+// void decompress_mgpu_gds(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
 
 } // namespace nvcz

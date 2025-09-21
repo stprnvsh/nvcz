@@ -2,6 +2,7 @@
 #include "nvcz/mgpu.hpp"   // Header, MAGIC, MgpuTune, Algo
 #include "nvcz/util.hpp"   // die, cuda_ck, nv_ck, fread_exact/fwrite_exact, read_chunk_into_ptr
 #include "nvcz/codec.hpp"
+#include "nvcz/gds.hpp"
 
 #include <thread>
 #include <mutex>
@@ -103,9 +104,9 @@ struct ResC {
   uint64_t idx = 0;
   uint64_t raw_n = 0;
   PinBlock raw;               // return to raw_free after writer done
-  PinBlock* comp = nullptr;   // pointer to pre-allocated buffer
-  size_t*  comp_size_host = nullptr; // reference to pre-allocated pinned host size_t
-  size_t*  d_comp_size = nullptr; // reference to pre-allocated device-side size_t
+  PinBlock comp;              // owned; return to comp_free after writer done
+  PinSize  comp_size_host;    // owned pinned host size_t buffer
+  size_t*  d_comp_size = nullptr;    // reference to pre-allocated device-side size_t
   cudaEvent_t done = nullptr; // stream event marking completion
 };
 
@@ -186,9 +187,9 @@ MgpuTune pick_mgpu_tuning(const AutoTune& base, bool size_aware,
 //                                         COMPRESS
 // =====================================================================================
 
-static void worker_compress(int gpu_id, int streams_per_gpu, Algo algo,
+static void worker_compress(int gpu_id, int streams_per_gpu, Algo algo, size_t chunk_bytes,
                             Queue<JobC>& in, Queue<ResC>& out,
-                            FreeList<PinBlock>& raw_free,
+                            FreeList<PinBlock>& raw_free, FreeList<PinBlock>& comp_free,
                             std::atomic<bool>& any_error)
 {
   try {
@@ -199,52 +200,61 @@ static void worker_compress(int gpu_id, int streams_per_gpu, Algo algo,
     auto codec = make_codec(algo, 64);  // Use default 64KB chunks for MGPU for now
     if (!codec) die("codec not available in worker");
 
-    // Pre-allocate per-stream pinned size_t and device size_t buffers
-    std::vector<PinSize> h_sizes(streams_per_gpu);
+    // Pre-allocate per-stream device size_t buffers (host size carried per-result)
     std::vector<size_t*> d_sizes(streams_per_gpu, nullptr);
-    std::vector<PinBlock> comp_buffers(streams_per_gpu * 2);  // 2 per stream for ping-pong
 
-    // Compute worst-case compressed size for this chunk size
-    const size_t CHUNK_SIZE = 32ULL * 1024 * 1024;  // Default chunk size used by autotune
+    // Compute worst-case compressed size for this configured chunk size
+    const size_t CHUNK_SIZE = chunk_bytes;
     const size_t WORST = codec->max_compressed_bound(CHUNK_SIZE);
 
     for (int i = 0; i < streams_per_gpu; ++i) {
-      h_sizes[i].alloc();  // Pre-allocate pinned host size_t
       cuda_ck(cudaMallocAsync(reinterpret_cast<void**>(&d_sizes[i]), sizeof(size_t), ss[i]), "malloc d_comp_size per stream");
-      // Pre-allocate compressed buffers per stream (no more dynamic allocation)
-      for (int j = 0; j < 2; ++j) {
-        comp_buffers[i * 2 + j].alloc_exact(WORST);
-      }
+    }
+
+    // Persistent device buffers per stream
+    std::vector<void*> d_in(streams_per_gpu, nullptr);
+    std::vector<void*> d_out(streams_per_gpu, nullptr);
+    for (int i=0;i<streams_per_gpu;++i) {
+      cuda_ck(cudaMalloc(&d_in[i], CHUNK_SIZE), "malloc d_in (mgpu c)");
+      cuda_ck(cudaMalloc(&d_out[i], WORST), "malloc d_out (mgpu c)");
     }
 
     size_t lane = 0;
     JobC j;
     while (in.pop(j)) {
-      // get output pinned block (use pre-allocated buffer, no allocation)
+      // get output pinned block from global pool (no reuse until writer returns)
       int stream_idx = lane % ss.size();
-      int buffer_idx = (lane / ss.size()) % 2;  // Alternate between 2 buffers per stream
-      PinBlock& comp = comp_buffers[stream_idx * 2 + buffer_idx];
+      PinBlock comp = comp_free.get();
+      if (comp.cap < WORST) comp.alloc_exact(WORST);
 
       cudaStream_t s = ss[stream_idx];
 
-      // compress async; codec copies D->H bound bytes to comp.p and writes exact size to d_comp_size
-      codec->compress_with_stream(j.raw.p, j.raw.n, comp.p, s, d_sizes[stream_idx]);
+      // H2D into persistent device buffer
+      cuda_ck(cudaMemcpyAsync(d_in[stream_idx], j.raw.p, j.raw.n, cudaMemcpyHostToDevice, s), "H2D raw (mgpu)");
 
-      // stage final size into pinned host size_t
-      cuda_ck(cudaMemcpyAsync(h_sizes[stream_idx].p, d_sizes[stream_idx], sizeof(size_t), cudaMemcpyDeviceToHost, s), "D2H comp size");
+      // compress async device-to-device; writes exact size to d_sizes[stream_idx]
+      codec->compress_dd(d_in[stream_idx], j.raw.n, d_out[stream_idx], s, d_sizes[stream_idx]);
+
+      // stage final size into a per-result pinned host size_t (owned by ResC)
+      PinSize host_size;
+      host_size.alloc();
+      cuda_ck(cudaMemcpyAsync(host_size.p, d_sizes[stream_idx], sizeof(size_t), cudaMemcpyDeviceToHost, s), "D2H comp size");
+
+      // D2H bound-sized payload into pinned comp buffer; writer will trim
+      cuda_ck(cudaMemcpyAsync(comp.p, d_out[stream_idx], WORST, cudaMemcpyDeviceToHost, s), "D2H comp bound (mgpu)");
 
       // fence completion
       cudaEvent_t ev{};
       cuda_ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "evt create");
       cuda_ck(cudaEventRecord(ev, s), "evt record");
 
-      // ship result - reference pre-allocated buffers, don't own them
+      // ship result - transfer ownership of pinned comp buffer to writer
       ResC r;
       r.idx           = j.idx;
       r.raw_n         = j.raw.n;
       r.raw           = std::move(j.raw);
-      r.comp          = &comp;  // Pointer to pre-allocated buffer
-      r.comp_size_host= h_sizes[stream_idx].p;  // Reference to pre-allocated pinned host size_t
+      r.comp          = std::move(comp);
+      r.comp_size_host= std::move(host_size);   // transfer ownership
       r.d_comp_size   = d_sizes[stream_idx];    // Reference to pre-allocated device size_t
       r.done          = ev;
 
@@ -256,6 +266,11 @@ static void worker_compress(int gpu_id, int streams_per_gpu, Algo algo,
     for (int i = 0; i < streams_per_gpu; ++i) {
       cudaFreeAsync(d_sizes[i], ss[i]);
       // Note: h_sizes will be cleaned up by destructor
+    }
+
+    for (int i=0;i<streams_per_gpu;++i) {
+      if (d_in[i])  cudaFree(d_in[i]);
+      if (d_out[i]) cudaFree(d_out[i]);
     }
 
     for (auto s: ss) cuda_ck(cudaStreamDestroy(s), "rm stream");
@@ -271,10 +286,13 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
   const int    NGPU  = (int)t.gpu_ids.size();
   const int    RING_PER_GPU = std::max(3, t.streams_per_gpu * 2); // generous per-GPU ring
 
-  // header
+  // header via pwrite
+  int out_fd = fileno(output_fp);
   Header h{}; std::memcpy(h.magic, MAGIC, 5);
   h.version = 1; h.algo = (uint8_t)algo; h.chunk_mb = t.chunk_mb;
-  fwrite_exact(&h, sizeof(h), output_fp);
+  off_t out_off = 0;
+  if (::pwrite(out_fd, &h, sizeof(h), out_off) != (ssize_t)sizeof(h)) die("pwrite header (mgpu gds)");
+  out_off += sizeof(h);
 
   // compute worst bound once
   auto bound_codec = make_codec(algo, 64);  // Use default 64KB chunks for MGPU for now
@@ -286,13 +304,16 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
   std::atomic<uint64_t> output_bytes{0};
   std::atomic<uint64_t> chunks_processed{0};
 
-  // global free-lists (comp_free removed since we pre-allocate per-stream)
+  // global free-lists
   FreeList<PinBlock> raw_free;
+  FreeList<PinBlock> comp_free;
 
-  // pre-alloc pinned buffers (comp pools removed - pre-allocated per-stream)
+  // pre-alloc pinned buffers
   const int RAW_POOL  = std::max(1, NGPU) * RING_PER_GPU;
+  const int COMP_POOL = std::max(1, NGPU) * RING_PER_GPU;
 
   for (int i=0;i<RAW_POOL;  ++i){ PinBlock b; b.alloc_exact(CHUNK); raw_free.put(std::move(b)); }
+  for (int i=0;i<COMP_POOL; ++i){ PinBlock b; b.alloc_exact(WORST);  comp_free.put(std::move(b)); }
 
   Queue<JobC> q_jobs;
   Queue<ResC> q_results;
@@ -346,9 +367,9 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
   // workers
   std::vector<std::thread> workers;
   for (int gpu_id : t.gpu_ids) {
-    workers.emplace_back(worker_compress, gpu_id, t.streams_per_gpu, algo,
+    workers.emplace_back(worker_compress, gpu_id, t.streams_per_gpu, algo, CHUNK,
                          std::ref(q_jobs), std::ref(q_results),
-                         std::ref(raw_free),
+                         std::ref(raw_free), std::ref(comp_free),
                          std::ref(any_error));
   }
 
@@ -387,22 +408,21 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
         cudaEventDestroy(rr.done);
 
         // read the exact size
-        const size_t comp_len = *(rr.comp_size_host);
+        const size_t comp_len = *(rr.comp_size_host.p);
         const uint64_t raw_len = rr.raw_n;
 
         // frame + payload
         fwrite_exact(&raw_len,  sizeof(raw_len),  output_fp);
         fwrite_exact(&comp_len, sizeof(comp_len), output_fp);
-        fwrite_exact(rr.comp->p, comp_len, output_fp);
+        fwrite_exact(rr.comp.p, comp_len, output_fp);
 
         // Update progress counters
         output_bytes.fetch_add(sizeof(raw_len) + sizeof(comp_len) + comp_len);
         chunks_processed.fetch_add(1);
 
-        // recycle buffers - comp buffer is pre-allocated per-stream and reused
-        // Note: rr.d_comp_size and rr.comp_size_host are now pre-allocated per-stream and reused
-        // Note: rr.comp is also pre-allocated per-stream and reused (no need to return to pool)
+        // recycle buffers to pools
         raw_free.put(std::move(rr.raw));
+        comp_free.put(std::move(rr.comp));
 
         hold.erase(it);
         next++;
@@ -446,6 +466,166 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
   if (any_error.load()) die("MGPU compress failed");
 }
 
+void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress)
+{
+  const size_t CHUNK = size_t(t.chunk_mb) * 1024 * 1024;
+  const int    NGPU  = (int)t.gpu_ids.size();
+  const int    RING_PER_GPU = std::max(3, t.streams_per_gpu * 2);
+
+  // header
+  Header h{}; std::memcpy(h.magic, MAGIC, 5);
+  h.version = 1; h.algo = (uint8_t)algo; h.chunk_mb = t.chunk_mb;
+  fwrite_exact(&h, sizeof(h), output_fp);
+
+  // compute worst bound once
+  auto bound_codec = make_codec(algo, 64);
+  if (!bound_codec) die("codec not available (compress bound)");
+  const size_t WORST = bound_codec->max_compressed_bound(CHUNK);
+
+  // Open GDS on stdin/stdout descriptors if they are regular files
+  int in_fd = fileno(input_fp);
+  int out_fd = fileno(output_fp);
+  nvcz::GDSFile gds_in;  bool gds_in_ok  = gds_in.open_fd(in_fd);
+  nvcz::GDSFile gds_out; bool gds_out_ok = gds_out.open_fd(out_fd);
+  if (!gds_in_ok || !gds_out_ok) die("GDS open failed (mgpu)");
+
+  // Progress tracking
+  std::atomic<uint64_t> input_bytes{0};
+  std::atomic<uint64_t> output_bytes{0};
+  std::atomic<uint64_t> chunks_processed{0};
+
+  // workers
+  struct JobC { uint64_t idx=0; size_t n=0; int lane=0; off_t file_off=0; };
+  struct ResC { uint64_t idx=0; uint64_t raw_n=0; PinSize comp_size_host; void* d_comp_dev=nullptr; size_t* d_comp_size=nullptr; cudaEvent_t done=nullptr; int lane=0; };
+
+  Queue<JobC> q_jobs;
+  Queue<ResC> q_results;
+  std::atomic<bool> any_error{false};
+
+  // No host comp pool needed for GDS path (zero-copy device->file)
+
+  // Launch per-GPU workers
+  std::vector<std::thread> workers;
+  for (int gpu_id : t.gpu_ids) {
+    workers.emplace_back([&, gpu_id]{
+      try {
+        cuda_ck(cudaSetDevice(gpu_id), "set device");
+        auto codec = make_codec(algo, 64);
+        if (!codec) die("codec not available in worker");
+
+        std::vector<cudaStream_t> ss(t.streams_per_gpu);
+        for (int i=0;i<t.streams_per_gpu;++i) cuda_ck(cudaStreamCreate(&ss[i]), "mk stream");
+
+        const size_t CHUNK_SIZE = CHUNK;
+        const size_t BOUND = codec->max_compressed_bound(CHUNK_SIZE);
+
+        // per-stream device buffers
+        std::vector<void*> d_in(t.streams_per_gpu, nullptr);
+        // d_out allocated per job (freed by writer)
+        std::vector<size_t*> d_sizes(t.streams_per_gpu, nullptr);
+        for (int i=0;i<t.streams_per_gpu;++i){
+          cuda_ck(cudaMalloc(&d_in[i],  CHUNK_SIZE), "mgpu gds d_in");
+          cuda_ck(cudaMallocAsync((void**)&d_sizes[i], sizeof(size_t), ss[i]), "mgpu gds d_sz");
+        }
+
+        JobC j;
+        while (q_jobs.pop(j)) {
+          int lane = j.lane % ss.size();
+          cudaStream_t s = ss[lane];
+
+          // Read from file directly into device buffer
+          ssize_t got = gds_in.read_to_gpu(d_in[lane], j.n, j.file_off);
+          if (got != (ssize_t)j.n) die("GDS read (mgpu)");
+          input_bytes.fetch_add(j.n);
+
+          // Allocate per-job device output buffer
+          void* d_out_job = nullptr;
+          cuda_ck(cudaMalloc(&d_out_job, BOUND), "mgpu gds d_out job");
+
+          // Compress device-to-device
+          codec->compress_dd(d_in[lane], j.n, d_out_job, s, d_sizes[lane]);
+
+          // stage size to host
+          PinSize hs; hs.alloc();
+          cuda_ck(cudaMemcpyAsync(hs.p, d_sizes[lane], sizeof(size_t), cudaMemcpyDeviceToHost, s), "D2H size (mgpu)");
+
+          // event
+          cudaEvent_t ev; cuda_ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "evt");
+          cuda_ck(cudaEventRecord(ev, s), "rec");
+
+          ResC r; r.idx=j.idx; r.raw_n=j.n; r.comp_size_host=std::move(hs); r.d_comp_dev=d_out_job; r.d_comp_size=d_sizes[lane]; r.done=ev; r.lane=lane;
+          q_results.push(std::move(r));
+        }
+
+        for (int i=0;i<t.streams_per_gpu;++i){
+          if (d_in[i]) cudaFree(d_in[i]);
+          if (d_sizes[i]) cudaFreeAsync(d_sizes[i], ss[i]);
+          cudaStreamDestroy(ss[i]);
+        }
+      } catch (...) {
+        any_error.store(true);
+        q_jobs.close();
+      }
+    });
+  }
+
+  // Writer thread: emit frames to output_fp using cuFile from device buffer
+  std::thread writer([&]{
+    uint64_t next=0;
+    std::map<uint64_t, ResC> hold;
+    ResC r;
+    off_t writer_off = sizeof(Header); // continue after header
+    while (q_results.pop(r)) { hold.emplace(r.idx, std::move(r));
+      while (true) {
+        auto it = hold.find(next); if (it==hold.end()) break; ResC &rr = it->second;
+        cuda_ck(cudaEventSynchronize(rr.done), "sync"); cudaEventDestroy(rr.done);
+        size_t comp_len = *(rr.comp_size_host.p);
+        uint64_t raw_len = rr.raw_n;
+        // Write frame header and payload using pwrite (headers) + fwrite payload
+        if (::pwrite(out_fd, &raw_len, sizeof(raw_len), writer_off) != (ssize_t)sizeof(raw_len)) die("pwrite r (mgpu gds)");
+        writer_off += sizeof(raw_len);
+        if (::pwrite(out_fd, &comp_len, sizeof(comp_len), writer_off) != (ssize_t)sizeof(comp_len)) die("pwrite c (mgpu gds)");
+        writer_off += sizeof(comp_len);
+        // payload: direct GPU->file write via GDS (zero-copy)
+        ssize_t w = gds_out.write_from_gpu(rr.d_comp_dev, comp_len, writer_off);
+        if (w != (ssize_t)comp_len) die("cuFileWrite (mgpu gds)");
+        // free per-job device buffer after event
+        cuda_ck(cudaFree(rr.d_comp_dev), "free d_out job");
+        writer_off += comp_len;
+        output_bytes.fetch_add(sizeof(raw_len)+sizeof(comp_len)+comp_len);
+        chunks_processed.fetch_add(1);
+        hold.erase(it); next++;
+      }
+    }
+    uint64_t z=0; fwrite_exact(&z,8,output_fp); fwrite_exact(&z,8,output_fp);
+    output_bytes.fetch_add(16);
+  });
+
+  // Dispatcher: enumerate file offsets and send jobs of size CHUNK
+  std::thread dispatcher([&]{
+    off_t off=0; uint64_t idx=0;
+    while (true) {
+      // Probe read amount by reading from CPU side just to detect EOF quickly
+      // For simplicity, use fstat to get size and compute number of chunks
+      struct stat st{}; if (fstat(fileno(input_fp), &st)!=0) die("stat (mgpu gds)");
+      uint64_t total = st.st_size;
+      if (off >= (off_t)total) break;
+      size_t n = std::min<size_t>(CHUNK, total - off);
+      JobC j; j.idx=idx++; j.n=n; j.file_off=off; j.lane=(int)(idx % (NGPU*t.streams_per_gpu));
+      q_jobs.push(std::move(j));
+      off += n;
+    }
+    q_jobs.close();
+  });
+
+  dispatcher.join();
+  for (auto& th: workers) th.join();
+  q_results.close();
+  writer.join();
+
+  if (any_error.load()) die("MGPU GDS compress failed");
+}
+
 // =====================================================================================
 //                                        DECOMPRESS
 // =====================================================================================
@@ -463,6 +643,12 @@ static void worker_decompress(int gpu_id, int streams_per_gpu, Algo algo,
     auto codec = make_codec(algo, 64);  // Use default 64KB chunks for MGPU for now
     if (!codec) die("codec not available in d worker");
 
+    // Persistent device buffers sized on demand per stream
+    std::vector<void*> d_in(streams_per_gpu, nullptr);
+    std::vector<size_t> d_in_cap(streams_per_gpu, 0);
+    std::vector<void*> d_out(streams_per_gpu, nullptr);
+    std::vector<size_t> d_out_cap(streams_per_gpu, 0);
+
     size_t lane=0;
     JobD j;
     while (in.pop(j)) {
@@ -473,7 +659,27 @@ static void worker_decompress(int gpu_id, int streams_per_gpu, Algo algo,
 
       cudaStream_t s = ss[lane % ss.size()];
 
-      codec->decompress_with_stream(j.comp.p, j.comp.n, raw.p, j.raw_n, s);
+      // Ensure persistent device buffer capacities
+      int stream_idx = lane % ss.size();
+      if (d_in_cap[stream_idx] < j.comp.n) {
+        if (d_in[stream_idx]) cudaFree(d_in[stream_idx]);
+        cuda_ck(cudaMalloc(&d_in[stream_idx], j.comp.n), "malloc d_in (mgpu d)");
+        d_in_cap[stream_idx] = j.comp.n;
+      }
+      if (d_out_cap[stream_idx] < j.raw_n) {
+        if (d_out[stream_idx]) cudaFree(d_out[stream_idx]);
+        cuda_ck(cudaMalloc(&d_out[stream_idx], j.raw_n), "malloc d_out (mgpu d)");
+        d_out_cap[stream_idx] = j.raw_n;
+      }
+
+      // H2D comp data into persistent device buffer
+      cuda_ck(cudaMemcpyAsync(d_in[stream_idx], j.comp.p, j.comp.n, cudaMemcpyHostToDevice, s), "H2D comp (mgpu)");
+
+      // Device-to-device decompress
+      codec->decompress_dd(d_in[stream_idx], j.comp.n, d_out[stream_idx], j.raw_n, s);
+
+      // D2H raw payload into pinned host
+      cuda_ck(cudaMemcpyAsync(raw.p, d_out[stream_idx], j.raw_n, cudaMemcpyDeviceToHost, s), "D2H raw (mgpu)");
 
       cudaEvent_t ev{};
       cuda_ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "evt create");
@@ -490,6 +696,11 @@ static void worker_decompress(int gpu_id, int streams_per_gpu, Algo algo,
     }
 
     for (auto s: ss) cuda_ck(cudaStreamDestroy(s), "rm d stream");
+
+    for (int i=0;i<streams_per_gpu;++i) {
+      if (d_in[i])  cudaFree(d_in[i]);
+      if (d_out[i]) cudaFree(d_out[i]);
+    }
   } catch (...) {
     any_error.store(true);
     in.close();

@@ -128,6 +128,46 @@ struct NvcompGDeflate : Codec {
     cuda_ck(cudaFreeAsync(d_in,  s), "gdef free d_in");
     cuda_ck(cudaFreeAsync(d_out, s), "gdef free d_out");
   }
+
+  void compress_dd(const void* d_src, size_t n,
+                   void* d_dst, cudaStream_t s,
+                   size_t* d_comp_size) override
+  {
+    nvcompBatchedGdeflateOpts_t opts{};
+
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
+    nvcomp::GdeflateManager mgr{
+        chunk_size,
+        opts,
+        s,
+        checksum_policy,
+        nvcomp::BitstreamKind::NVCOMP_NATIVE};
+
+    nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
+
+    mgr.compress(static_cast<const uint8_t*>(d_src),
+                 static_cast<uint8_t*>(d_dst),
+                 cfg,
+                 d_comp_size);
+  }
+
+  void decompress_dd(const void* d_comp, size_t comp_n,
+                     void* d_dst, size_t raw_n,
+                     cudaStream_t s) override
+  {
+    (void)comp_n;
+    std::shared_ptr<nvcomp::nvcompManagerBase> mgr =
+        nvcomp::create_manager(static_cast<const uint8_t*>(d_comp), s);
+    nvcomp::DecompressionConfig dcfg =
+        mgr->configure_decompression(static_cast<const uint8_t*>(d_comp), /*comp_size*/ nullptr);
+    mgr->decompress(static_cast<uint8_t*>(d_dst),
+                    static_cast<const uint8_t*>(d_comp),
+                    dcfg,
+                    /*comp_size*/ nullptr);
+  }
 };
 
 std::unique_ptr<Codec> make_codec_gdeflate(size_t chunk_size_kb, bool enable_checksum) { return std::make_unique<NvcompGDeflate>(chunk_size_kb, enable_checksum); }

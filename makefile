@@ -11,11 +11,11 @@ NVCOMP_INC ?= /usr/include
 NVCOMP_LIB ?= /usr/lib
 
 CXXFLAGS := -O2 -std=c++17 -Iinclude -I$(CUDA_INC) -I$(NVCOMP_INC)
-LDFLAGS  := -L$(CUDA_LIB) -L$(NVCOMP_LIB) -lnvcomp -lcudart -ldl
+LDFLAGS  := -L$(CUDA_LIB) -L$(NVCOMP_LIB) -lnvcomp -lcudart -lcufile -ldl
 
 SRC := src/util.cpp src/autotune.cpp \
        src/codec_lz4.cpp src/codec_gdeflate.cpp src/codec_snappy.cpp src/codec_zstd.cpp \
-       src/codec_factory.cpp src/mgpu.cpp src/main.cpp
+       src/codec_factory.cpp src/mgpu.cpp src/gds.cpp src/main.cpp
 
 BIN := nvcz
 

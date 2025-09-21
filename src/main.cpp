@@ -4,6 +4,7 @@
 #include "nvcz/util.hpp"
 #include "nvcz/autotune.hpp"
 #include "nvcz/mgpu.hpp"   // CLI still supports --mgpu
+#include "nvcz/gds.hpp"
 
 #include <vector>
 #include <string>
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <thread>
 #include <iostream>
+#include <fcntl.h>
 
 using namespace nvcz;
 
@@ -27,16 +29,208 @@ static void usage() {
     "Usage:\n"
     "  nvcz compress --algo {lz4|gdeflate|snappy|zstd} [--chunk-mb N] [--nvcomp-chunk-kb N] [--auto] [--streams N]\n"
     "                [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size] [--progress] [--checksum]\n"
-    "                [-i input_file] [-o output_file] [input_files...]\n"
+    "                [-i input_file] [-o output_file] [input_files...] [--gds]\n"
     "  nvcz decompress [--auto] [--streams N] [--progress] [--checksum]\n"
     "                  [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size]\n"
-    "                  [-i input_file] [-o output_file] [input_files...]\n"
+    "                  [-i input_file] [-o output_file] [input_files...] [--gds]\n"
     "Examples:\n"
     "  cat in.bin | nvcz compress --algo lz4 --auto --progress --checksum > out.nvcz\n"
     "  nvcz decompress --progress --checksum < out.nvcz > out.bin\n"
     "  nvcz compress --algo lz4 -i input.bin -o output.nvcz --progress --checksum\n"
     "  nvcz decompress -i input.nvcz -o output.bin --progress --checksum\n"
     "  nvcz compress --algo gdeflate --nvcomp-chunk-kb 256 --mgpu --gpus 0,1 -i big.bin -o big.nvcz --progress --checksum\n");
+}
+static void cmd_compress_gds(Algo algo, uint32_t chunk_mb, size_t nvcomp_chunk_kb,
+                             bool show_progress, bool enable_checksum, const std::string& in_path,
+                             const std::string& out_path)
+{
+  // Progress tracking
+  std::atomic<uint64_t> input_bytes{0};
+  std::atomic<uint64_t> output_bytes{0};
+  std::atomic<uint64_t> chunks_processed{0};
+
+  // Open files and GDS handles
+  int in_fd  = ::open(in_path.c_str(),  O_RDONLY);
+  int out_fd = ::open(out_path.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
+  if (in_fd < 0 || out_fd < 0) die("open failed (gds)");
+
+  nvcz::GDSFile gds_in;  if (!gds_in.open_fd(in_fd))  die("GDS open input failed");
+  nvcz::GDSFile gds_out; if (!gds_out.open_fd(out_fd)) die("GDS open output failed");
+
+  auto codec = make_codec(algo, nvcomp_chunk_kb, enable_checksum);
+  if (!codec) die("codec not available");
+
+  // Header via pwrite
+  Header h{}; std::memcpy(h.magic, MAGIC, 5);
+  h.version = 1; h.algo = (uint8_t)algo; h.chunk_mb = chunk_mb;
+  off_t out_off = 0;
+  if (::pwrite(out_fd, &h, sizeof(h), out_off) != (ssize_t)sizeof(h)) die("pwrite header (gds)");
+  out_off += sizeof(h);
+  output_bytes.fetch_add(sizeof(h));
+
+  // Progress thread
+  std::thread progress_thread; std::atomic<bool> progress_running{true};
+  if (show_progress) {
+    progress_thread = std::thread([&](){
+      auto start_time = std::chrono::steady_clock::now();
+      while (progress_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        if (elapsed > 0) {
+          double in_mb = input_bytes.load() / (1024.0*1024.0);
+          double out_mb = output_bytes.load() / (1024.0*1024.0);
+          double ratio = input_bytes.load() ? (double)output_bytes.load() / input_bytes.load() : 0.0;
+          double speed_in = in_mb / elapsed;
+          double speed_out = out_mb / elapsed;
+          std::fprintf(stderr, "\rGDS Progress: %.1f MB in, %.1f MB out (%.2fx), %.1f MB/s in, %.1f MB/s out, %lu chunks",
+                       in_mb, out_mb, ratio, speed_in, speed_out, chunks_processed.load());
+          std::fflush(stderr);
+        }
+      }
+    });
+  }
+
+  const size_t CHUNK = size_t(chunk_mb) * 1024 * 1024;
+  const size_t WORST = codec->max_compressed_bound(CHUNK);
+
+  // Device buffers + size ptr
+  void* d_in=nullptr;  void* d_out=nullptr;  size_t* d_sz=nullptr;  void* d_hdr=nullptr;
+  cuda_ck(cudaMalloc(&d_in, CHUNK), "gds d_in");
+  cuda_ck(cudaMalloc(&d_out, WORST), "gds d_out");
+  cuda_ck(cudaMalloc(&d_sz, sizeof(size_t)), "gds d_sz");
+  cuda_ck(cudaMalloc(&d_hdr, 16), "gds d_hdr");
+  cudaStream_t s; cuda_ck(cudaStreamCreate(&s), "gds stream");
+
+  size_t comp_len_host=0;
+
+  off_t in_off = 0;
+  for (;;) {
+    // Read file → GPU
+    ssize_t r = gds_in.read_to_gpu(d_in, CHUNK, in_off);
+    if (r < 0) die("GDS read failed");
+    if (r == 0) break; // EOF
+    in_off += r; input_bytes.fetch_add(r);
+
+    // Compress on GPU
+    codec->compress_dd(d_in, (size_t)r, d_out, s, d_sz);
+
+    // Build header fully on device (H2D raw_len, D2D comp_len)
+    cuda_ck(cudaMemcpyAsync(d_hdr, &r, sizeof(uint64_t), cudaMemcpyHostToDevice, s), "gds H2D header raw_len");
+    cuda_ck(cudaMemcpyAsync(static_cast<uint8_t*>(d_hdr)+8, d_sz, sizeof(size_t), cudaMemcpyDeviceToDevice, s), "gds D2D header comp_len");
+    cuda_ck(cudaStreamSynchronize(s), "gds sync");
+    // Fetch comp_len to host only to provide length to cuFileWrite (API requires size on host)
+    cuda_ck(cudaMemcpy(&comp_len_host, d_sz, sizeof(size_t), cudaMemcpyDeviceToHost), "gds D2H size");
+
+    // Frame header via pwrite
+    uint64_t raw_len = (uint64_t)r;
+    // Write header from device buffer (zero-copy)
+    ssize_t wh = gds_out.write_from_gpu(d_hdr, 16, out_off);
+    if (wh != 16) die("GDS write header failed");
+    out_off += 16;
+    output_bytes.fetch_add(16);
+
+    // Write GPU buffer → file
+    ssize_t w = gds_out.write_from_gpu(d_out, comp_len_host, out_off);
+    if (w != (ssize_t)comp_len_host) die("GDS write failed");
+    out_off += w; output_bytes.fetch_add(w);
+    chunks_processed.fetch_add(1);
+  }
+
+  // Trailer
+  uint64_t z=0; if (::pwrite(out_fd, &z, 8, out_off) != 8) die("pwrite z1"); out_off+=8;
+  if (::pwrite(out_fd, &z, 8, out_off) != 8) die("pwrite z2"); out_off+=8; output_bytes.fetch_add(16);
+
+  cudaFree(d_in); cudaFree(d_out); cudaFree(d_sz); cudaFree(d_hdr);
+  cudaStreamDestroy(s);
+
+  if (show_progress) {
+    progress_running = false; progress_thread.join();
+    double in_mb = input_bytes.load() / (1024.0*1024.0);
+    double out_mb = output_bytes.load() / (1024.0*1024.0);
+    double ratio = input_bytes.load() ? (double)output_bytes.load() / input_bytes.load() : 0.0;
+    std::fprintf(stderr, "\nGDS Final: %.1f MB in, %.1f MB out (%.2fx), %lu chunks\n",
+                 in_mb, out_mb, ratio, chunks_processed.load());
+  }
+}
+
+static void cmd_decompress_gds(int cli_streams, size_t nvcomp_chunk_kb,
+                               bool show_progress, const std::string& in_path,
+                               const std::string& out_path)
+{
+  std::atomic<uint64_t> input_bytes{0};
+  std::atomic<uint64_t> output_bytes{0};
+  std::atomic<uint64_t> chunks_processed{0};
+
+  int in_fd  = ::open(in_path.c_str(),  O_RDONLY);
+  int out_fd = ::open(out_path.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
+  if (in_fd < 0 || out_fd < 0) die("open failed (gds d)");
+
+  nvcz::GDSFile gds_in;  if (!gds_in.open_fd(in_fd))  die("GDS open input failed");
+  nvcz::GDSFile gds_out; if (!gds_out.open_fd(out_fd)) die("GDS open output failed");
+
+  // Read header via pread
+  Header h{}; if (::pread(in_fd, &h, sizeof(h), 0) != (ssize_t)sizeof(h)) die("pread header");
+  if (std::memcmp(h.magic, MAGIC, 5)!=0 || h.version!=1) die("bad header");
+  input_bytes.fetch_add(sizeof(h));
+  auto algo = (Algo)h.algo;
+  const size_t CHUNK = size_t(h.chunk_mb) * 1024 * 1024;
+
+  auto codec = make_codec(algo, nvcomp_chunk_kb);
+  if (!codec) die("codec not available");
+
+  void* d_in=nullptr; void* d_out=nullptr; cuda_ck(cudaMalloc(&d_in, codec->max_compressed_bound(CHUNK)), "gds d_in d");
+  cuda_ck(cudaMalloc(&d_out, CHUNK), "gds d_out d");
+  cudaStream_t s; cuda_ck(cudaStreamCreate(&s), "gds stream d");
+
+  // Progress thread
+  std::thread progress_thread; std::atomic<bool> progress_running{true};
+  if (show_progress) {
+    progress_thread = std::thread([&](){
+      auto start_time = std::chrono::steady_clock::now();
+      while (progress_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        if (elapsed > 0) {
+          double in_mb = input_bytes.load() / (1024.0*1024.0);
+          double out_mb = output_bytes.load() / (1024.0*1024.0);
+          double ratio = out_mb > 0 ? in_mb/out_mb : 0.0;
+          double speed_in = in_mb / elapsed;
+          double speed_out = out_mb / elapsed;
+          std::fprintf(stderr, "\rGDS Decomp: %.1f MB in, %.1f MB out (%.2fx), %.1f MB/s in, %.1f MB/s out, %lu chunks",
+                       in_mb, out_mb, ratio, speed_in, speed_out, chunks_processed.load());
+          std::fflush(stderr);
+        }
+      }
+    });
+  }
+
+  off_t in_off = sizeof(h);
+  for (;;) {
+    uint64_t r=0, c=0;
+    if (::pread(in_fd, &r, sizeof(r), in_off) != (ssize_t)sizeof(r)) die("pread r"); in_off += sizeof(r);
+    if (::pread(in_fd, &c, sizeof(c), in_off) != (ssize_t)sizeof(c)) die("pread c"); in_off += sizeof(c);
+    input_bytes.fetch_add(sizeof(r)+sizeof(c));
+    if (r==0 && c==0) break;
+
+    // Read comp payload into GPU
+    ssize_t got = gds_in.read_to_gpu(d_in, c, in_off);
+    if (got != (ssize_t)c) die("GDS read comp (d)");
+    in_off += got; input_bytes.fetch_add(got);
+
+    // Decompress device-to-device
+    codec->decompress_dd(d_in, c, d_out, r, s);
+    cuda_ck(cudaStreamSynchronize(s), "sync dds");
+
+    // Write raw payload from GPU to file
+    ssize_t w = gds_out.write_from_gpu(d_out, r, -1);
+    if (w != (ssize_t)r) die("GDS write raw");
+    output_bytes.fetch_add(w); chunks_processed.fetch_add(1);
+  }
+
+  cudaFree(d_in); cudaFree(d_out); cudaStreamDestroy(s);
+  if (show_progress) { progress_running=false; progress_thread.join(); }
 }
 
 static Algo parse_algo(const std::string& s) {
@@ -148,6 +342,14 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
     }
   }
 
+  // Persistent device buffers per stream (avoid per-chunk cudaMalloc)
+  std::vector<void*> d_in(streams, nullptr);
+  std::vector<void*> d_out(streams, nullptr);
+  for (int i=0;i<streams;++i) {
+    cuda_ck(cudaMalloc(&d_in[i], CHUNK), "malloc d_in (sg)");
+    cuda_ck(cudaMalloc(&d_out[i], worst), "malloc d_out (sg)");
+  }
+
   struct Job {
     uint64_t     seq = 0;
     int          stream = 0;
@@ -202,16 +404,24 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
 
       // use pre-allocated device size buffer (reused per stream)
 
-      // launch async compress on stream i; codec copies up to bound to comp, writes true size to dev size
-      codec->compress_with_stream(
-          host[i].raw[s].bytes(), got,
-          comp_buffers[i][s].bytes(),
+      // H2D input into persistent device buffer
+      cuda_ck(cudaMemcpyAsync(d_in[i], host[i].raw[s].bytes(), got,
+                              cudaMemcpyHostToDevice, ss[i]), "H2D raw (sg)");
+
+      // launch async device-to-device compress; writes exact size to device size ptr
+      codec->compress_dd(
+          d_in[i], got,
+          d_out[i],
           ss[i],
           host[i].sz[0].dev);
 
-      // also stage the size to host pinned
+      // stage the size to host pinned
       cuda_ck(cudaMemcpyAsync(host[i].sz[s].host, host[i].sz[0].dev, sizeof(size_t),
                               cudaMemcpyDeviceToHost, ss[i]), "D2H comp size (sg)");
+
+      // D2H bound-sized payload into pinned host buffer (writer trims to true size later)
+      cuda_ck(cudaMemcpyAsync(comp_buffers[i][s].bytes(), d_out[i], worst,
+                              cudaMemcpyDeviceToHost, ss[i]), "D2H comp bound (sg)");
 
       // fence completion with an event
       cudaEvent_t ev; cuda_ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "mk event (c)");
@@ -256,6 +466,12 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
     if (host[i].sz[0].dev) {
       cudaFreeAsync(host[i].sz[0].dev, 0);
     }
+  }
+
+  // free persistent device buffers
+  for (int i=0;i<streams;++i) {
+    if (d_in[i])  cudaFree(d_in[i]);
+    if (d_out[i]) cudaFree(d_out[i]);
   }
 
   // comp_buffers will be cleaned up automatically by destructor
@@ -365,6 +581,18 @@ static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_
     }
   }
 
+  // Persistent device buffers per stream for decode path
+  const size_t WORST = codec->max_compressed_bound(CHUNK);
+  std::vector<void*> d_in(streams, nullptr);
+  std::vector<size_t> d_in_cap(streams, 0);
+  std::vector<void*> d_out(streams, nullptr);
+  for (int i=0;i<streams;++i) {
+    // Start with worst-bound input capacity; will grow if needed
+    cuda_ck(cudaMalloc(&d_in[i], WORST), "malloc d_in (sg d)");
+    d_in_cap[i] = WORST;
+    cuda_ck(cudaMalloc(&d_out[i], CHUNK), "malloc d_out (sg d)");
+  }
+
   struct Job {
     uint64_t     seq = 0;
     int          stream = 0;
@@ -420,11 +648,26 @@ static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_
       // Update input bytes for compressed data
       input_bytes.fetch_add(c);
 
-      // launch async decomp
-      codec->decompress_with_stream(
-        host[i].comp[s].bytes(), c,
-        host[i].raw[s].bytes(),  r,
+      // Ensure device input capacity
+      if (d_in_cap[i] < c) {
+        cudaFree(d_in[i]);
+        cuda_ck(cudaMalloc(&d_in[i], c), "realloc d_in (sg d)");
+        d_in_cap[i] = c;
+      }
+
+      // H2D compressed payload
+      cuda_ck(cudaMemcpyAsync(d_in[i], host[i].comp[s].bytes(), c,
+                              cudaMemcpyHostToDevice, ss[i]), "H2D comp (sg)");
+
+      // Device-to-device decompress
+      codec->decompress_dd(
+        d_in[i], c,
+        d_out[i],  r,
         ss[i]);
+
+      // D2H raw into pinned buffer
+      cuda_ck(cudaMemcpyAsync(host[i].raw[s].bytes(), d_out[i], r,
+                              cudaMemcpyDeviceToHost, ss[i]), "D2H raw (sg)");
 
       cudaEvent_t ev; cuda_ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "mk event (d)");
       cuda_ck(cudaEventRecord(ev, ss[i]), "record event (d)");
@@ -456,6 +699,12 @@ done_read:
   }
 
   for (auto s : ss) cuda_ck(cudaStreamDestroy(s), "rm d stream");
+
+  // Free persistent device buffers
+  for (int i=0;i<streams;++i) {
+    if (d_in[i])  cudaFree(d_in[i]);
+    if (d_out[i]) cudaFree(d_out[i]);
+  }
 
   // Stop progress reporting and show final statistics
   if (show_progress) {
@@ -544,6 +793,7 @@ int main(int argc, char** argv)
     }
     else if (a=="-p" || a=="--progress") { show_progress = true; }
     else if (a=="-c" || a=="--checksum") { enable_checksum = true; }
+    else if (a=="--gds") { /* accept flag; handled later */ }
     else if (a[0] != '-' || a=="--") {
       // Non-option arguments are treated as input files
       input_files.push_back(a);
@@ -586,18 +836,32 @@ int main(int argc, char** argv)
 
   try {
     if (mode=="compress") {
-      if (mgpu) {
+      // If GDS requested via paths and flags
+      bool want_gds = false;
+      for (int i=2;i<argc;++i) if (std::string(argv[i]) == "--gds") want_gds = true;
+      if (want_gds && !input_file.empty() && !output_file.empty() && !mgpu) {
+        cmd_compress_gds(parse_algo(algo_str), chunk_mb, nvcomp_chunk_kb, show_progress, enable_checksum, input_file, output_file);
+      } else if (mgpu) {
         AutoTune base = auto_tune ? pick_tuning(/*verbose=*/true)
                                   : AutoTune{chunk_mb, std::max(1, streams)};
         auto t = pick_mgpu_tuning(base, /*size_aware=*/auto_size,
                                   streams_per_gpu_override, gpu_ids_override);
         if (!auto_tune) t.chunk_mb = chunk_mb;
-        compress_mgpu(parse_algo(algo_str), t, input_fp, output_fp, show_progress);
+        if (want_gds && !input_file.empty() && !output_file.empty()) {
+          // Reopen I/O as FILE* and pass to mgpu_gds (we already dup2'd stdin/stdout earlier)
+          compress_mgpu_gds(parse_algo(algo_str), t, input_fp, output_fp, show_progress);
+        } else {
+          compress_mgpu(parse_algo(algo_str), t, input_fp, output_fp, show_progress);
+        }
       } else {
         cmd_compress(parse_algo(algo_str), chunk_mb, auto_tune, streams, nvcomp_chunk_kb, show_progress, input_fp, enable_checksum);
       }
     } else if (mode=="decompress") {
-      if (mgpu) {
+      bool want_gds = false;
+      for (int i=2;i<argc;++i) if (std::string(argv[i]) == "--gds") want_gds = true;
+      if (want_gds && !input_file.empty() && !output_file.empty() && !mgpu) {
+        cmd_decompress_gds(streams, nvcomp_chunk_kb, show_progress, input_file, output_file);
+      } else if (mgpu) {
         AutoTune base = auto_tune ? pick_tuning(/*verbose=*/true)
                                   : AutoTune{chunk_mb, std::max(1, streams)};
         auto t = pick_mgpu_tuning(base, /*size_aware=*/auto_size,
