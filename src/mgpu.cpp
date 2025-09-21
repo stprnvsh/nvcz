@@ -337,7 +337,7 @@ void compress_mgpu(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* output_fp
             percentage = static_cast<double>(in) / total_input_size;
           }
 
-          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks);
+          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks, true); // Test checksum display
         }
       }
     });
@@ -580,7 +580,7 @@ void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool sh
             percentage = static_cast<double>(in) / total_input_size;
           }
 
-          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks);
+          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks, true); // Test checksum display
         }
       }
     });

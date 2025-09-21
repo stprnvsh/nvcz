@@ -12,19 +12,25 @@ namespace nvcz {
 
 struct NvcompLZ4 : Codec {
   const size_t chunk_size;
+  const bool enable_checksum;
 
-  NvcompLZ4(size_t chunk_size_kb) : chunk_size(chunk_size_kb * 1024) {}
-  const char* name() const override { return "nvcomp-lz4"; }
+  NvcompLZ4(size_t chunk_size_kb, bool enable_checksum)
+    : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
+  const char* name() const override { return enable_checksum ? "nvcomp-lz4-checksum" : "nvcomp-lz4"; }
 
   // Ask the manager for a tight bound for an input of length n.
   size_t max_compressed_bound(size_t n) const override {
     nvcompBatchedLZ4Opts_t opts{};      // defaults
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::LZ4Manager mgr{
         chunk_size,
         opts,
         /*stream*/ 0,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
@@ -42,11 +48,15 @@ struct NvcompLZ4 : Codec {
                             size_t* d_comp_size) override {
     nvcompBatchedLZ4Opts_t opts{};
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::LZ4Manager mgr{
         chunk_size,
         opts,
         s,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     // Sizing for this input
@@ -113,6 +123,6 @@ struct NvcompLZ4 : Codec {
   }
 };
 
-std::unique_ptr<Codec> make_codec_lz4(size_t chunk_size_kb) { return std::make_unique<NvcompLZ4>(chunk_size_kb); }
+std::unique_ptr<Codec> make_codec_lz4(size_t chunk_size_kb, bool enable_checksum) { return std::make_unique<NvcompLZ4>(chunk_size_kb, enable_checksum); }
 
 } // namespace nvcz

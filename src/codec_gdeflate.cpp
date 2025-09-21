@@ -12,19 +12,25 @@ namespace nvcz {
 
 struct NvcompGDeflate : Codec {
   const size_t chunk_size;
+  const bool enable_checksum;
 
-  NvcompGDeflate(size_t chunk_size_kb) : chunk_size(chunk_size_kb * 1024) {}
-  const char* name() const override { return "nvcomp-gdeflate"; }
+  NvcompGDeflate(size_t chunk_size_kb, bool enable_checksum)
+    : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
+  const char* name() const override { return enable_checksum ? "nvcomp-gdeflate-checksum" : "nvcomp-gdeflate"; }
 
   // Ask the manager for a safe max compressed buffer size for an input of length n.
   size_t max_compressed_bound(size_t n) const override {
     nvcompBatchedGdeflateOpts_t opts{}; // defaults
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::GdeflateManager mgr{
         chunk_size,
         opts,
         /*stream*/ 0,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
@@ -43,11 +49,15 @@ struct NvcompGDeflate : Codec {
   {
     nvcompBatchedGdeflateOpts_t opts{};
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::GdeflateManager mgr{
         chunk_size,
         opts,
         s,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
@@ -120,6 +130,6 @@ struct NvcompGDeflate : Codec {
   }
 };
 
-std::unique_ptr<Codec> make_codec_gdeflate(size_t chunk_size_kb) { return std::make_unique<NvcompGDeflate>(chunk_size_kb); }
+std::unique_ptr<Codec> make_codec_gdeflate(size_t chunk_size_kb, bool enable_checksum) { return std::make_unique<NvcompGDeflate>(chunk_size_kb, enable_checksum); }
 
 } // namespace nvcz

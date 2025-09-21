@@ -36,6 +36,6 @@ struct Codec {
 extern size_t g_nvcomp_chunk_size_kb;
 
 // Central factory (implemented in src/codec_factory.cpp)
-std::unique_ptr<Codec> make_codec(Algo, size_t nvcomp_chunk_size_kb = g_nvcomp_chunk_size_kb);
+std::unique_ptr<Codec> make_codec(Algo, size_t nvcomp_chunk_size_kb = g_nvcomp_chunk_size_kb, bool enable_checksum = false);
 
 } // namespace nvcz

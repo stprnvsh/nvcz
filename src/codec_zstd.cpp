@@ -12,19 +12,25 @@ namespace nvcz {
 
 struct NvcompZstd : Codec {
   const size_t chunk_size;
+  const bool enable_checksum;
 
-  NvcompZstd(size_t chunk_size_kb) : chunk_size(chunk_size_kb * 1024) {}
-  const char* name() const override { return "nvcomp-zstd"; }
+  NvcompZstd(size_t chunk_size_kb, bool enable_checksum)
+    : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
+  const char* name() const override { return enable_checksum ? "nvcomp-zstd-checksum" : "nvcomp-zstd"; }
 
   // Ask the manager for a safe max compressed size for an input of length n.
   size_t max_compressed_bound(size_t n) const override {
     nvcompBatchedZstdOpts_t opts{};     // defaults
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::ZstdManager mgr{
         chunk_size,
         opts,
         /*stream*/ 0,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
@@ -43,11 +49,15 @@ struct NvcompZstd : Codec {
   {
     nvcompBatchedZstdOpts_t opts{};
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::ZstdManager mgr{
         chunk_size,
         opts,
         s,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
@@ -120,6 +130,6 @@ struct NvcompZstd : Codec {
   }
 };
 
-std::unique_ptr<Codec> make_codec_zstd(size_t chunk_size_kb) { return std::make_unique<NvcompZstd>(chunk_size_kb); }
+std::unique_ptr<Codec> make_codec_zstd(size_t chunk_size_kb, bool enable_checksum) { return std::make_unique<NvcompZstd>(chunk_size_kb, enable_checksum); }
 
 } // namespace nvcz

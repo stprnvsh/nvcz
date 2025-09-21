@@ -12,19 +12,25 @@ namespace nvcz {
 
 struct NvcompSnappy : Codec {
   const size_t chunk_size;
+  const bool enable_checksum;
 
-  NvcompSnappy(size_t chunk_size_kb) : chunk_size(chunk_size_kb * 1024) {}
-  const char* name() const override { return "nvcomp-snappy"; }
+  NvcompSnappy(size_t chunk_size_kb, bool enable_checksum)
+    : chunk_size(chunk_size_kb * 1024), enable_checksum(enable_checksum) {}
+  const char* name() const override { return enable_checksum ? "nvcomp-snappy-checksum" : "nvcomp-snappy"; }
 
   // Ask the manager for a safe max compressed buffer size for an input of length n.
   size_t max_compressed_bound(size_t n) const override {
     nvcompBatchedSnappyOpts_t opts{};   // defaults
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::SnappyManager mgr{
         chunk_size,
         opts,
         /*stream*/ 0,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
@@ -43,11 +49,15 @@ struct NvcompSnappy : Codec {
   {
     nvcompBatchedSnappyOpts_t opts{};
 
+    nvcomp::ChecksumPolicy checksum_policy = enable_checksum ?
+        nvcomp::ChecksumPolicy::ComputeAndVerify :
+        nvcomp::ChecksumPolicy::NoComputeNoVerify;
+
     nvcomp::SnappyManager mgr{
         chunk_size,
         opts,
         s,
-        nvcomp::ChecksumPolicy::NoComputeNoVerify,
+        checksum_policy,
         nvcomp::BitstreamKind::NVCOMP_NATIVE};
 
     nvcomp::CompressionConfig cfg = mgr.configure_compression(n);
@@ -120,6 +130,6 @@ struct NvcompSnappy : Codec {
   }
 };
 
-std::unique_ptr<Codec> make_codec_snappy(size_t chunk_size_kb) { return std::make_unique<NvcompSnappy>(chunk_size_kb); }
+std::unique_ptr<Codec> make_codec_snappy(size_t chunk_size_kb, bool enable_checksum) { return std::make_unique<NvcompSnappy>(chunk_size_kb, enable_checksum); }
 
 } // namespace nvcz

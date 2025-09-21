@@ -26,17 +26,17 @@ static void usage() {
     "nvcz: stream compressor using nvCOMP (LZ4, GDeflate, Snappy, Zstd)\n"
     "Usage:\n"
     "  nvcz compress --algo {lz4|gdeflate|snappy|zstd} [--chunk-mb N] [--nvcomp-chunk-kb N] [--auto] [--streams N]\n"
-    "                [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size] [--progress]\n"
+    "                [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size] [--progress] [--checksum]\n"
     "                [-i input_file] [-o output_file] [input_files...]\n"
-    "  nvcz decompress [--auto] [--streams N] [--progress]\n"
+    "  nvcz decompress [--auto] [--streams N] [--progress] [--checksum]\n"
     "                  [--mgpu] [--gpus all|0,2,3] [--streams-per-gpu N] [--auto-size]\n"
     "                  [-i input_file] [-o output_file] [input_files...]\n"
     "Examples:\n"
-    "  cat in.bin | nvcz compress --algo lz4 --auto --progress > out.nvcz\n"
-    "  nvcz decompress --progress < out.nvcz > out.bin\n"
-    "  nvcz compress --algo lz4 -i input.bin -o output.nvcz --progress\n"
-    "  nvcz decompress -i input.nvcz -o output.bin --progress\n"
-    "  nvcz compress --algo gdeflate --nvcomp-chunk-kb 256 --mgpu --gpus 0,1 -i big.bin -o big.nvcz --progress\n");
+    "  cat in.bin | nvcz compress --algo lz4 --auto --progress --checksum > out.nvcz\n"
+    "  nvcz decompress --progress --checksum < out.nvcz > out.bin\n"
+    "  nvcz compress --algo lz4 -i input.bin -o output.nvcz --progress --checksum\n"
+    "  nvcz decompress -i input.nvcz -o output.bin --progress --checksum\n"
+    "  nvcz compress --algo gdeflate --nvcomp-chunk-kb 256 --mgpu --gpus 0,1 -i big.bin -o big.nvcz --progress --checksum\n");
 }
 
 static Algo parse_algo(const std::string& s) {
@@ -55,7 +55,7 @@ static Algo parse_algo(const std::string& s) {
 //  - Worker/SG path issues cudaMemcpyAsync(host_size <- d_comp_size) and fences with an event.
 //  - Writer reads *(host_size) after event and writes exactly that many bytes.
 
-static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb, bool show_progress, FILE* input_fp)
+static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb, bool show_progress, FILE* input_fp, bool enable_checksum)
 {
   AutoTune t{};
   if (auto_tune) t = pick_tuning(/*verbose=*/true);
@@ -80,7 +80,7 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
   std::atomic<bool> progress_running{true};
 
   if (show_progress) {
-    progress_thread = std::thread([&]() {
+    progress_thread = std::thread([&input_fp, &progress_running, &input_bytes, &output_bytes, &chunks_processed, &enable_checksum]() {
       auto start_time = std::chrono::steady_clock::now();
 
       while (progress_running) {
@@ -282,7 +282,7 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
 
 // ---------------- pinned + overlapped single-GPU decompress ----------------
 
-static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb, bool show_progress, FILE* input_fp)
+static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_kb, bool show_progress, FILE* input_fp, bool enable_checksum)
 {
   // Progress tracking
   std::atomic<uint64_t> input_bytes{0};
@@ -307,7 +307,7 @@ static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_
   std::atomic<bool> progress_running{true};
 
   if (show_progress) {
-    progress_thread = std::thread([&]() {
+    progress_thread = std::thread([&input_fp, &progress_running, &input_bytes, &output_bytes, &chunks_processed, &enable_checksum]() {
       auto start_time = std::chrono::steady_clock::now();
 
       // Try to get input file size for percentage calculation
@@ -342,7 +342,7 @@ static void cmd_decompress(bool auto_tune, int cli_streams, size_t nvcomp_chunk_
             percentage = static_cast<double>(in) / total_input_size;
           }
 
-          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks);
+          nvcz::render_progress_bar(percentage, in, has_total_size ? total_input_size : in, ratio, speed_in, speed_out, chunks, enable_checksum);
         }
       }
     });
@@ -496,6 +496,9 @@ int main(int argc, char** argv)
   // Progress and statistics
   bool show_progress = false;
 
+  // Checksum verification
+  bool enable_checksum = false;
+
   // MGPU flags
   bool mgpu=false, auto_size=false;
   int streams_per_gpu_override=0;
@@ -540,6 +543,7 @@ int main(int argc, char** argv)
       } else { usage(); return 1; }
     }
     else if (a=="-p" || a=="--progress") { show_progress = true; }
+    else if (a=="-c" || a=="--checksum") { enable_checksum = true; }
     else if (a[0] != '-' || a=="--") {
       // Non-option arguments are treated as input files
       input_files.push_back(a);
@@ -590,7 +594,7 @@ int main(int argc, char** argv)
         if (!auto_tune) t.chunk_mb = chunk_mb;
         compress_mgpu(parse_algo(algo_str), t, input_fp, output_fp, show_progress);
       } else {
-        cmd_compress(parse_algo(algo_str), chunk_mb, auto_tune, streams, nvcomp_chunk_kb, show_progress, input_fp);
+        cmd_compress(parse_algo(algo_str), chunk_mb, auto_tune, streams, nvcomp_chunk_kb, show_progress, input_fp, enable_checksum);
       }
     } else if (mode=="decompress") {
       if (mgpu) {
@@ -600,7 +604,7 @@ int main(int argc, char** argv)
                                   streams_per_gpu_override, gpu_ids_override);
         decompress_mgpu(t, input_fp, output_fp, show_progress);
       } else {
-        cmd_decompress(auto_tune, streams, nvcomp_chunk_kb, show_progress, input_fp);
+        cmd_decompress(auto_tune, streams, nvcomp_chunk_kb, show_progress, input_fp, enable_checksum);
       }
     } else {
       usage(); return 1;

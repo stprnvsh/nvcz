@@ -86,7 +86,7 @@ inline size_t read_chunk(void* dst, size_t max_n) {
 }
 
 // ----- Progress bar rendering -----
-inline void render_progress_bar(double percentage, uint64_t current, uint64_t total, double ratio, double speed_in, double speed_out, uint64_t chunks) {
+inline void render_progress_bar(double percentage, uint64_t current, uint64_t total, double ratio, double speed_in, double speed_out, uint64_t chunks, bool enable_checksum = false) {
   const int bar_width = 20;
   int filled_width = static_cast<int>(percentage * bar_width);
 
@@ -111,7 +111,8 @@ inline void render_progress_bar(double percentage, uint64_t current, uint64_t to
   bool is_compressing = (ratio > 1.0);  // ratio > 1 means compression (input > output)
   std::string mode = is_compressing ? "compress" : "decompress";
 
-  std::fprintf(stderr, "\r%s: %.1f%% %s %.1f/%.1f MB (%.2fx) %.1f/%.1f MB/s %lu chunks",
+  std::string checksum_info = enable_checksum ? " [checksum]" : "";
+  std::fprintf(stderr, "\r%s: %.1f%% %s %.1f/%.1f MB (%.2fx) %.1f/%.1f MB/s %lu chunks%s",
               mode.c_str(),
               percentage * 100.0,
               bar.c_str(),
@@ -120,7 +121,8 @@ inline void render_progress_bar(double percentage, uint64_t current, uint64_t to
               ratio,
               speed_in,
               speed_out,
-              chunks);
+              chunks,
+              checksum_info.c_str());
   std::fflush(stderr);
 }
 
