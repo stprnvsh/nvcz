@@ -17,6 +17,8 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <functional>
+#include <iostream>
 
 namespace nvcz {
 
@@ -263,11 +265,11 @@ static void worker_compress(int gpu_id, int streams_per_gpu, Algo algo,
 
 void compress_mgpu(Algo algo, const MgpuTune& t)
 {
-  compress_mgpu_with_files(algo, t, stdin, stdout, nullptr);
+  compress_mgpu_with_files(algo, t, &std::cin, &std::cout);
 }
 
-void compress_mgpu_with_files(Algo algo, const MgpuTune& t, FILE* input_file, FILE* output_file,
-                             std::function<void(size_t, size_t)> progress_callback)
+void compress_mgpu_with_files(Algo algo, const MgpuTune& t, std::istream* input_file, std::ostream* output_file,
+                             std::function<void(size_t, size_t)> progress_callback, size_t total_size)
 {
   const size_t CHUNK = size_t(t.chunk_mb) * 1024 * 1024;
   const int    NGPU  = (int)t.gpu_ids.size();
@@ -360,7 +362,7 @@ void compress_mgpu_with_files(Algo algo, const MgpuTune& t, FILE* input_file, FI
         if (progress_callback) {
           static size_t total_processed = 0;
           total_processed += raw_len;
-          progress_callback(total_processed, 0); // We don't know total size in streaming mode
+          progress_callback(total_processed, total_size);
         }
       }
     };
@@ -435,11 +437,11 @@ static void worker_decompress(int gpu_id, int streams_per_gpu, Algo algo,
 
 void decompress_mgpu(const MgpuTune& t)
 {
-  decompress_mgpu_with_files(t, stdin, stdout, nullptr);
+  decompress_mgpu_with_files(t, &std::cin, &std::cout);
 }
 
-void decompress_mgpu_with_files(const MgpuTune& t, FILE* input_file, FILE* output_file,
-                               std::function<void(size_t, size_t)> progress_callback)
+void decompress_mgpu_with_files(const MgpuTune& t, std::istream* input_file, std::ostream* output_file,
+                               std::function<void(size_t, size_t)> progress_callback, size_t total_size)
 {
   // header
   Header h{}; fread_exact(&h, sizeof(h), input_file);
@@ -483,8 +485,10 @@ void decompress_mgpu_with_files(const MgpuTune& t, FILE* input_file, FILE* outpu
     uint64_t idx=0;
     for (;;) {
       uint64_t r=0, c=0;
-      size_t got_r = std::fread(&r,1,sizeof(r),input_file);
-      size_t got_c = std::fread(&c,1,sizeof(c),input_file);
+      input_file->read(reinterpret_cast<char*>(&r), sizeof(r));
+      input_file->read(reinterpret_cast<char*>(&c), sizeof(c));
+      size_t got_r = input_file->gcount();
+      size_t got_c = input_file->gcount();
       if (got_r != sizeof(r) || got_c != sizeof(c)) die("truncated header");
       if (r==0 && c==0) break;
 
@@ -525,7 +529,7 @@ void decompress_mgpu_with_files(const MgpuTune& t, FILE* input_file, FILE* outpu
         if (progress_callback) {
           static size_t total_processed = 0;
           total_processed += rr.raw.n;
-          progress_callback(total_processed, 0); // We don't know total size in streaming mode
+          progress_callback(total_processed, total_size);
         }
       }
     };

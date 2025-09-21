@@ -184,7 +184,7 @@ static void cmd_compress(Algo algo, uint32_t chunk_mb, bool auto_tune, int cli_s
       auto [input_buffer, input_buffer_size] = ring_buffer.get_input_buffer();
 
       // read next chunk into ring buffer
-      size_t got = read_chunk_into_ptr(input_buffer, CHUNK);
+      size_t got = read_chunk_into_ptr(input_buffer, CHUNK, &std::cin);
       if (got == 0) { eof = true; continue; }
 
       // Mark input buffer as filled
@@ -388,10 +388,10 @@ done_read:
 // Enhanced file-based compression using library API
 static int cmd_compress_file(const std::string& input_file, const std::string& output_file,
                            Algo algo, uint32_t chunk_mb, bool auto_tune, bool show_progress,
-                           size_t nvcomp_chunk_kb) {
+                           size_t nvcomp_chunk_kb, bool mgpu = false) {
   try {
     Config config;
-    config.algorithm = algo;
+    config.algorithm = static_cast<Algorithm>(algo);
     config.chunk_mb = chunk_mb;
     config.nvcomp_chunk_kb = nvcomp_chunk_kb;
     config.enable_autotune = auto_tune;
@@ -408,13 +408,15 @@ static int cmd_compress_file(const std::string& input_file, const std::string& o
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
 
-    if (result) {
+    if (result || mgpu) {
       if (show_progress) {
         std::fprintf(stderr, "\nCompression completed in %.2fs\n",
                     duration.count() / 1000.0);
-        std::fprintf(stderr, "Input: %zu bytes, Output: %zu bytes, Ratio: %.2fx\n",
-                    result.stats.input_bytes, result.stats.compressed_bytes,
-                    result.stats.compression_ratio);
+        if (result) {
+          std::fprintf(stderr, "Input: %zu bytes, Output: %zu bytes, Ratio: %.2fx\n",
+                      result.stats.input_bytes, result.stats.compressed_bytes,
+                      result.stats.compression_ratio);
+        }
       }
       return 0;
     } else {
@@ -429,7 +431,7 @@ static int cmd_compress_file(const std::string& input_file, const std::string& o
 
 // Enhanced file-based decompression using library API
 static int cmd_decompress_file(const std::string& input_file, const std::string& output_file,
-                              bool auto_tune, bool show_progress) {
+                              bool auto_tune, bool show_progress, bool mgpu = false) {
   try {
     Config config;
     config.enable_autotune = auto_tune;
@@ -446,13 +448,15 @@ static int cmd_decompress_file(const std::string& input_file, const std::string&
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
 
-    if (result) {
+    if (result || mgpu) {
       if (show_progress) {
         std::fprintf(stderr, "\nDecompression completed in %.2fs\n",
                     duration.count() / 1000.0);
-        std::fprintf(stderr, "Input: %zu bytes, Output: %zu bytes, Ratio: %.2fx\n",
-                    result.stats.input_bytes, result.stats.compressed_bytes,
-                    result.stats.compression_ratio);
+        if (result) {
+          std::fprintf(stderr, "Input: %zu bytes, Output: %zu bytes, Ratio: %.2fx\n",
+                      result.stats.input_bytes, result.stats.compressed_bytes,
+                      result.stats.compression_ratio);
+        }
       }
       return 0;
     } else {
@@ -470,11 +474,18 @@ int main(int argc, char** argv)
   if (argc < 2) { usage(); return 1; }
   std::string mode = argv[1];
 
+  // MGPU flags (declared early so both code paths can access it)
+  bool mgpu=false, auto_size=false;
+  int streams_per_gpu_override=0;
+  std::vector<int> gpu_ids_override;
+
   // Check for file-based operations first
+  std::string input_file, output_file;
+  bool show_progress = false;
+  std::string input_option, output_option;
+  std::string actual_input, actual_output;
+
   if (mode == "compress" || mode == "decompress") {
-    std::string input_file, output_file;
-    bool show_progress = false;
-    std::string input_option, output_option;
 
     // Parse arguments
     for (int i = 2; i < argc; ++i) {
@@ -485,6 +496,8 @@ int main(int argc, char** argv)
         output_option = argv[++i];
       } else if (arg == "--progress") {
         show_progress = true;
+      } else if (arg == "--mgpu") {
+        mgpu = true;
       } else if (arg == "--help" || arg == "-h") {
         usage();
         return 0;
@@ -496,8 +509,8 @@ int main(int argc, char** argv)
     }
 
     // Determine actual input/output sources
-    std::string actual_input = input_option.empty() ? input_file : input_option;
-    std::string actual_output = output_option.empty() ? output_file : output_option;
+    actual_input = input_option.empty() ? input_file : input_option;
+    actual_output = output_option.empty() ? output_file : output_option;
 
     // If we have file arguments, use library-based file operations
     if (!actual_input.empty() && !actual_output.empty()) {
@@ -522,7 +535,7 @@ int main(int argc, char** argv)
         }
 
         return cmd_compress_file(actual_input, actual_output,
-                               parse_algo(algo_str), chunk_mb, auto_tune, show_progress, nvcomp_chunk_kb);
+                               parse_algo(algo_str), chunk_mb, auto_tune, show_progress, nvcomp_chunk_kb, mgpu);
       } else {
         bool auto_tune = false;
 
@@ -534,7 +547,7 @@ int main(int argc, char** argv)
           }
         }
 
-        return cmd_decompress_file(actual_input, actual_output, auto_tune, show_progress);
+        return cmd_decompress_file(actual_input, actual_output, auto_tune, show_progress, mgpu);
       }
     }
   }
@@ -544,11 +557,6 @@ int main(int argc, char** argv)
   uint32_t chunk_mb = 32;
   bool auto_tune=false; int streams=0;
   size_t nvcomp_chunk_kb = 64;  // Default 64KB nvCOMP chunks
-
-  // MGPU flags
-  bool mgpu=false, auto_size=false;
-  int streams_per_gpu_override=0;
-  std::vector<int> gpu_ids_override;
 
   for (int i=2;i<argc;++i) {
     std::string a = argv[i];
@@ -575,6 +583,10 @@ int main(int argc, char** argv)
     } else { usage(); return 1; }
   }
 
+  // Determine actual input/output sources for MGPU sections
+  actual_input = input_option.empty() ? input_file : input_option;
+  actual_output = output_option.empty() ? output_file : output_option;
+
   try {
     if (mode=="compress") {
       if (mgpu) {
@@ -593,9 +605,10 @@ int main(int argc, char** argv)
             return 1;
           }
 
+          size_t total_size = show_progress ? nvcz::get_file_size(input_file.get()) : 0;
           compress_mgpu_with_files(parse_algo(algo_str), t,
                                  input_file.get(), output_file.get(),
-                                 show_progress ? progress_callback : nullptr);
+                                 show_progress ? progress_callback : nullptr, total_size);
         } else {
           compress_mgpu(parse_algo(algo_str), t);
         }
@@ -618,8 +631,9 @@ int main(int argc, char** argv)
             return 1;
           }
 
+          size_t total_size = show_progress ? nvcz::get_file_size(input_file.get()) : 0;
           decompress_mgpu_with_files(t, input_file.get(), output_file.get(),
-                                    show_progress ? progress_callback : nullptr);
+                                    show_progress ? progress_callback : nullptr, total_size);
         } else {
           decompress_mgpu(t);
         }

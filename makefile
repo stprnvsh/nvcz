@@ -49,7 +49,7 @@ lib-static: sanity $(LIB_STATIC)
 all: sanity cli lib
 
 # Library-specific flags
-LIB_CXXFLAGS := $(CXXFLAGS) -fPIC -shared -fvisibility=hidden
+LIB_CXXFLAGS := $(CXXFLAGS) -fPIC -fvisibility=hidden
 LIB_LDFLAGS := $(LDFLAGS) -shared
 
 # Build CLI executable
@@ -67,6 +67,10 @@ $(LIB_STATIC): $(LIB_OBJ)
 # Pattern rule for object files
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Pattern rule for library object files (with PIC)
+src/%.o: src/%.cpp
+	$(CXX) $(CXXFLAGS) -fPIC -c $< -o $@
 
 sanity:
 	@test -f $(CUDA_INC)/cuda_runtime.h || { echo ">>> cuda_runtime.h not found in $(CUDA_INC). Set CUDA_HOME=/opt/cuda (or your path)"; exit 1; }

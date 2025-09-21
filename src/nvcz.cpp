@@ -114,7 +114,7 @@ public:
     }
 
     size_t get_max_compressed_size(size_t input_size) const {
-        auto codec = make_codec(config_.algorithm, config_.nvcomp_chunk_kb);
+        auto codec = make_codec(static_cast<Algo>(config_.algorithm), config_.nvcomp_chunk_kb);
         return codec ? codec->max_compressed_bound(input_size) : 0;
     }
 
@@ -122,31 +122,8 @@ public:
         return stats_;
     }
 
-    // File-based operations
-    Result compress_file_internal(const std::string& input_file,
-                                 const std::string& output_file,
-                                 size_t chunk_size_mb,
-                                 ProgressCallback progress_callback);
 
-    Result decompress_file_internal(const std::string& input_file,
-                                   const std::string& output_file,
-                                   ProgressCallback progress_callback);
-
-    // Streaming operations
-    StreamingStats compress_with_streaming_internal(StreamProcessor* processor,
-                                                  const RingBufferConfig& ring_config,
-                                                  ProgressCallback progress_callback);
-
-    StreamingStats decompress_with_streaming_internal(StreamProcessor* processor,
-                                                     const RingBufferConfig& ring_config,
-                                                     ProgressCallback progress_callback);
-
-    // Multi-GPU operations
-    bool enable_multi_gpu_internal(const std::vector<int>& gpu_ids, int streams_per_gpu);
-    std::vector<int> get_active_gpus_internal() const;
-    StreamingStats get_streaming_stats_internal() const;
-
-private:
+public:
     Config config_;
     CompressionStats stats_;
     StreamingStats streaming_stats_;
@@ -215,7 +192,7 @@ private:
 
         // For now, use a simplified approach - in a full implementation,
         // this would use the same streaming logic as the CLI but with callbacks
-        auto codec = make_codec(config_.algorithm, config_.nvcomp_chunk_kb);
+        auto codec = make_codec(static_cast<Algo>(config_.algorithm), config_.nvcomp_chunk_kb);
         if (!codec) {
             result.success = false;
             result.error_message = "Failed to create codec";
@@ -287,7 +264,7 @@ private:
 
         // For now, use a simplified approach - in a full implementation,
         // this would handle the framing format
-        auto codec = make_codec(config_.algorithm, config_.nvcomp_chunk_kb);
+        auto codec = make_codec(static_cast<Algo>(config_.algorithm), config_.nvcomp_chunk_kb);
         if (!codec) {
             result.success = false;
             result.error_message = "Failed to create codec";
@@ -764,6 +741,24 @@ private:
 
     StreamingStats get_streaming_stats_internal() const {
         return streaming_stats_;
+    }
+
+    Config get_config() const {
+        return config_;
+    }
+
+    Result update_config(const Config& config) {
+        Result result;
+        try {
+            config_ = config;
+            // Re-initialize with new config
+            initialize();
+            result.success = true;
+        } catch (const std::exception& e) {
+            result.success = false;
+            result.error_message = e.what();
+        }
+        return result;
     }
 };
 

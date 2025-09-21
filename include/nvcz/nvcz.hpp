@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <chrono>
 #include <cuda_runtime.h>
 
 namespace nvcz {
