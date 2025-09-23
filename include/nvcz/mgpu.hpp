@@ -36,7 +36,7 @@ void compress_mgpu_gds(Algo algo, const MgpuTune& t, FILE* input_fp, FILE* outpu
 // Decompress stdin -> stdout in-order using multiple GPUs
 void decompress_mgpu(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
 
-// (Optional) Decompress using GPUDirect Storage (to be implemented later)
-// void decompress_mgpu_gds(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
+// Decompress using GPUDirect Storage (reads/writes directly from/to GPU)
+void decompress_mgpu_gds(const MgpuTune& t, FILE* input_fp, FILE* output_fp, bool show_progress);
 
 } // namespace nvcz
