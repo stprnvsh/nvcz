@@ -393,46 +393,6 @@ nvcz automatically optimizes performance based on hardware characteristics:
 
 The architecture is specifically designed to saturate both GPU compute and PCIe bandwidth while maintaining streaming behavior suitable for real-time and large-scale data processing applications.
 
-## ⚡ Performance
-
-nvcz delivers exceptional compression performance by leveraging GPU acceleration and sophisticated optimizations:
-
-### Benchmark Results
-
-#### Single GPU Performance (RTX 4090)
-
-| Algorithm | Compression | Decompression | Ratio |
-|-----------|-------------|---------------|-------|
-| **LZ4** | 25 GB/s | 85 GB/s | 2.1x |
-| **GDeflate** | 18 GB/s | 65 GB/s | 2.8x |
-| **Snappy** | 22 GB/s | 75 GB/s | 2.3x |
-| **Zstd** | 8 GB/s | 35 GB/s | 3.5x |
-
-#### Multi-GPU Performance (2× RTX 4090)
-
-| Algorithm | Compression | Decompression | Scaling |
-|-----------|-------------|---------------|---------|
-| **LZ4** | 48 GB/s | 165 GB/s | 1.92x |
-| **GDeflate** | 34 GB/s | 125 GB/s | 1.89x |
-| **Snappy** | 42 GB/s | 145 GB/s | 1.91x |
-| **Zstd** | 15 GB/s | 68 GB/s | 1.88x |
-
-#### Comparison with CPU Tools
-
-| Dataset | gzip (CPU) | nvcz LZ4 | Speedup |
-|---------|------------|----------|---------|
-| 10 GB Text | 45 MB/s | 25 GB/s | **555x** |
-| 10 GB Binary | 180 MB/s | 22 GB/s | **122x** |
-| 100 GB Mixed | 85 MB/s | 24 GB/s | **282x** |
-
-### Performance Characteristics
-
-- **Throughput**: Up to 50 GB/s on modern GPUs
-- **Efficiency**: 90-95% GPU utilization during compression
-- **Scalability**: Near-linear scaling across multiple GPUs
-- **Latency**: 1-5ms processing latency for typical chunks
-- **Memory**: 2-8 GB GPU RAM for optimal performance
-
 ### Optimization Tips
 
 1. **Use LZ4** for maximum speed in I/O bound scenarios
