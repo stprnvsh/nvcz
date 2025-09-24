@@ -32,6 +32,7 @@ nvcz is a command-line utility that leverages NVIDIA GPUs and the [nvCOMP](https
 - [Command Line Reference](#command-line-reference)
 - [Examples](#examples)
 - [Integration](#integration)
+  - [CUDA Checkpoint + CRIU/gVisor with nvcz](#cuda-checkpoint--criugvisor-with-nvcz)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -493,6 +494,71 @@ nc -l 9999 | nvcz decompress > received_file.bin
 ```
 
 ### Pipeline Integration Examples
+
+#### CUDA Checkpoint + CRIU/gVisor with nvcz
+
+Minimal wrappers to use NVIDIA's cuda-checkpoint with CRIU (and gVisor) while compressing checkpoint images via nvcz.
+
+Prereqs:
+- cuda-checkpoint in PATH
+- criu installed
+- runsc (gVisor) in PATH for gVisor usage
+- nvcz in PATH (or set env `NVCZ_BIN=/absolute/path/to/nvcz`)
+
+Scripts:
+- `scripts/criu_nvcz.sh`
+- `scripts/gvisor_nvcz.sh`
+
+Usage:
+```bash
+# Dump a CUDA process PID → compressed image
+scripts/criu_nvcz.sh dump <pid> /path/to/out.nvcz
+
+# Restore from compressed image
+scripts/criu_nvcz.sh restore /path/to/out.nvcz
+
+# Multi-PID (multi-GPU process tree) sequential dump → directory
+scripts/criu_nvcz.sh dump <pid1,pid2,pid3> /path/to/out_dir
+
+# Restore all images in a directory
+scripts/criu_nvcz.sh restore /path/to/out_dir
+
+# gVisor (runsc) variant: use container ID; optionally suspend specific CUDA PIDs
+scripts/gvisor_nvcz.sh dump <container_id> /path/to/out.nvcz [--pids pid1,pid2]
+scripts/gvisor_nvcz.sh restore <container_id> /path/to/out.nvcz
+
+# gVisor multiple containers to a dir
+scripts/gvisor_nvcz.sh dump <id1,id2> /path/to/out_dir [--pids pid1,pid2]
+scripts/gvisor_nvcz.sh restore <container_id> /path/to/out_dir
+
+# Cloud targets (requires CLIs: aws, gsutil, az)
+# S3 single
+scripts/criu_nvcz.sh dump <pid> s3://my-bucket/checkpoints/app.nvcz
+scripts/criu_nvcz.sh restore s3://my-bucket/checkpoints/app.nvcz
+
+# S3 multi-PID to prefix (must end with '/')
+scripts/criu_nvcz.sh dump <pid1,pid2> s3://my-bucket/checkpoints/app/
+
+# GCS single
+scripts/criu_nvcz.sh dump <pid> gs://my-bucket/checkpoints/app.nvcz
+scripts/criu_nvcz.sh restore gs://my-bucket/checkpoints/app.nvcz
+
+# Azure Blob single (set AZURE_STORAGE_ACCOUNT env)
+AZURE_STORAGE_ACCOUNT=myacct scripts/criu_nvcz.sh dump <pid> az://container/checkpoints/app.nvcz
+AZURE_STORAGE_ACCOUNT=myacct scripts/criu_nvcz.sh restore az://container/checkpoints/app.nvcz
+
+# gVisor + cloud (container ID)
+scripts/gvisor_nvcz.sh dump <container_id> s3://my-bucket/checkpoints/app.nvcz [--pids pid1]
+scripts/gvisor_nvcz.sh restore <container_id> s3://my-bucket/checkpoints/app.nvcz
+```
+
+Behavior:
+- Suspends/resumes CUDA using `cuda-checkpoint --toggle --pid <pid>` per NVIDIA guidance
+- Pipes CRIU image directory through tar | nvcz for compact storage
+- Restores images, resumes CUDA, prints restored PID if available
+- Cloud URIs supported: `s3://`, `gs://`, `az://` (azure). Multi-PID requires URI ending with `/` to act as a prefix.
+
+Reference: NVIDIA cuda-checkpoint utility and examples [`github.com/NVIDIA/cuda-checkpoint`](https://github.com/NVIDIA/cuda-checkpoint)
 
 #### Apache Spark Integration
 ```bash
